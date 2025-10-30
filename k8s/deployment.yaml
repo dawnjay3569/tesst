@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fapi-qexec
+  labels:
+    app: fapi-qexec
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fapi-qexec
+  template:
+    metadata:
+      labels:
+        app: fapi-qexec
+    spec:
+      containers:
+        - name: fapi-qexec
+          image: <YOUR_REGISTRY>/fapi-qexec:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: fapi-qexec-secrets
+          # No PVC mounts required when running against external DBs
+          readinessProbe:
+            httpGet:
+              path: /getallItems
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /getallItems
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      # No volumes configured

@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fapi
+  labels:
+    app: fapi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fapi
+  template:
+    metadata:
+      labels:
+        app: fapi
+    spec:
+      containers:
+        - name: fapi
+          image: fapi:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /docs       
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /docs       
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fapi-service
+  labels:
+    app: fapi
+spec:
+  selector:
+    app: fapi
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: NodePort  # for Minikube, this makes it reachable via minikube service

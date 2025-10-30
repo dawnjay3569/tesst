@@ -1,0 +1,11 @@
+__pycache__
+.venv
+*.pyc
+.env
+.env.local
+query_logs.log
+packages_folder
+*.db
+dist
+build
+.pytest_cache
