@@ -16,6 +16,10 @@ COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# Copy environment files
+COPY .env /app/.env
+COPY .env.local /app/.env.local
+
 # Copy application code
 COPY . /app
 
