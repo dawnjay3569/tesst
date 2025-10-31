@@ -15,6 +15,7 @@ from datetime import datetime
 import time
 import os
 from fastapi.responses import JSONResponse
+from file_loader_api.file_loader_service import process_file_loader_job
 
 app = FastAPI(title="FAPI_QExec")
 
@@ -341,6 +342,7 @@ def execute_config_bulk(
     csv_files: List[UploadFile] = File(...),
     bulk_insert: bool = Form(...),
     parallel: bool = Form(False),
+    file_loader: bool = Form(False),
     api_key: str = Depends(get_api_key),
 ):
     """
@@ -483,8 +485,51 @@ def execute_config_bulk(
             except Exception:
                 pass
 
-    # process jobs either sequentially or in parallel
+    # process jobs either using fileloader flow or the generic CSV-to-config flow
     results = []
+    if file_loader:
+        # Use the file loader service for each job. We fetch the config and pass it
+        # to the service which implements steps 6-14 (in-memory CSV handling).
+        if parallel:
+            with ThreadPoolExecutor(max_workers=min(4, len(jobs_list))) as ex:
+                futures = []
+                for job, upload in zip(jobs_list, csv_files):
+                    # fetch config for this job
+                    cfg = fetch_config_query(job.get("filename"), job.get("query_identifier"))
+                    if not cfg:
+                        results.append({"status": "error", "detail": f"Config not found for {job.get('filename')}:{job.get('query_identifier')}"})
+                        continue
+                    # augment cfg with inferred schema_table from query_text when possible
+                    try:
+                        # naive extract of table name from INSERT INTO <table> (...)
+                        import re
+                        m = re.search(r"insert\s+into\s+([\w\.\"]+)", cfg.get("query_text", ""), re.IGNORECASE)
+                        if m:
+                            cfg["schema_table"] = m.group(1)
+                    except Exception:
+                        pass
+                    futures.append(ex.submit(process_file_loader_job, cfg, upload, job.get("filename")))
+                for f in as_completed(futures):
+                    results.append(f.result())
+        else:
+            for job, upload in zip(jobs_list, csv_files):
+                cfg = fetch_config_query(job.get("filename"), job.get("query_identifier"))
+                if not cfg:
+                    results.append({"status": "error", "detail": f"Config not found for {job.get('filename')}:{job.get('query_identifier')}"})
+                    continue
+                # infer schema_table from query_text
+                try:
+                    import re
+                    m = re.search(r"insert\s+into\s+([\w\.\"]+)", cfg.get("query_text", ""), re.IGNORECASE)
+                    if m:
+                        cfg["schema_table"] = m.group(1)
+                except Exception:
+                    pass
+                results.append(process_file_loader_job(cfg, upload, job.get("filename")))
+        return JSONResponse(content={"results": results})
+
+    # If file_loader flag is not set, fall back to original generic CSV-to-config bulk insert
+    # process jobs either sequentially or in parallel using existing _process_job helper
     if parallel:
         # run in ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=min(4, len(jobs_list))) as ex:
