@@ -291,11 +291,14 @@ def run_generic_query(query: str, parameters: List[Any], options: QueryOptions, 
 def fetch_config_query(filename: str, query_identifier: str):
     engine = get_engine()
     with engine.connect() as conn:
-        res = conn.execute(text("SELECT query_text, bind_keys FROM config_table WHERE filename = :f AND query_identifier = :q"), {"f": filename, "q": query_identifier})
+        res = conn.execute(text("SELECT query_text, bind_keys, table_name, proc, load_action FROM config_table WHERE filename = :f AND query_identifier = :q"), {"f": filename, "q": query_identifier})
         row = res.fetchone()
         if not row:
             return None
-        return {"query_text": row[0], "bind_keys": row[1]}
+        query_text, bind_keys, table_name_col, proc_col, load_action_col = row[0], row[1], row[2], row[3], row[4]
+
+        cfg = {"query_text": query_text, "bind_keys": bind_keys, "TABLE_NAME": table_name_col, "PROC": proc_col, "LOAD_ACTION": load_action_col}
+        return cfg
 
 
 def validate_and_prepare_bind(bind_keys_csv: Optional[str], bind_variables: Dict[str, Any]):

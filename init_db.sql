@@ -10,5 +10,8 @@ CREATE TABLE config_table (
   filename VARCHAR2(4000) NOT NULL,
   query_identifier VARCHAR2(4000) NOT NULL,
   query_text CLOB NOT NULL,
-  bind_keys VARCHAR2(4000)
+  bind_keys VARCHAR2(4000),
+  table_name VARCHAR2(4000),
+  proc VARCHAR2(4000),
+  load_action VARCHAR2(50)
 );

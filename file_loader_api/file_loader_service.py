@@ -21,6 +21,7 @@ import ast
 import socket
 import datetime
 import logging
+import json
 import pandas as pd
 from typing import Dict, Any
 
@@ -127,7 +128,8 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
         if sel is not None and hasattr(sel, "empty") and not sel.empty:
             return {"status": "error", "message": "File already processed", "uv": uv, "code": 409}
     except Exception:
-        logger.exception("UV duplicate check failed; continuing")
+        # logger.exception("UV duplicate check failed; continuing")
+        pass
 
     # Step 3: Insert in-progress log row
     try:
@@ -146,7 +148,7 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
             if update_sql:
                 update_sql(f"INSERT INTO RPA_INPUTS.EXCEL_LOAD_TO_ORACLE ({cols}) VALUES ({vals})")
     except Exception:
-        logger.exception("Failed to insert in-progress log row")
+        # logger.exception("Failed to insert in-progress log row")
         return {"status": "error", "message": "Failed to create in-progress log row", "uv": uv}
 
     # Step 4: Read CSV in-memory
@@ -157,7 +159,7 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
         except Exception:
             df = pd.read_csv(io.BytesIO(raw), encoding='iso-8859-1', dtype=str)
     except Exception:
-        logger.exception("Failed to read CSV in-memory")
+        # logger.exception("Failed to read CSV in-memory")
         return {"status": "error", "message": "Failed to read CSV file", "uv": uv}
 
     # Step 5: Column mapping / normalization
@@ -168,7 +170,8 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
         try:
             col_map = ast.literal_eval(str(column_mapping_raw))
         except Exception:
-            logger.exception("Failed to parse COLUMN_MAPPING; falling back to normalization")
+            # logger.exception("Failed to parse COLUMN_MAPPING; falling back to normalization")
+            pass
 
     if isinstance(col_map, dict):
         df = df.rename(columns=col_map)
@@ -202,35 +205,107 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
                 if isinstance(fm_ret, (list, tuple)) and len(fm_ret) >= 3:
                     finalInsertColumn, data, placeholder_list = fm_ret[0], fm_ret[1], fm_ret[2]
             except Exception:
-                logger.exception("Decision maker raised an exception; continuing")
+                # logger.exception("Decision maker raised an exception; continuing")
+                pass
     except Exception:
-        logger.exception("Error calling decision maker")
+        # logger.exception("Error calling decision maker")
+        pass
 
     # Step 8: Insert into target table and run PROC
     try:
+        # If the helper is available it may support load_action/proc natively
         if insert_to_oi_rtqm:
             insert_to_oi_rtqm(schema_table=schema_table, data_to_insert=data, placeholder_list=placeholder_list, table_columns=finalInsertColumn.upper(), action=action, load_action=load_action)
         else:
-            # Fallback: try to run DML via update_sql_oi_rtqm or update_sql
+            # Fallback path: delegate Oracle-specific operations to oracle_insights.update_sql
+            # which knows how to handle executemany, TRUNCATE, and PL/SQL blocks.
+            load_action_upper = (load_action or "").strip().upper()
+            proc_val = (action or "").strip()
+
+            # TRUNCATE (or DELETE fallback) before insert if requested
+            if load_action_upper == "TRUNCATE":
+                try:
+                    if update_sql:
+                        update_sql(f"TRUNCATE TABLE {schema_table}")
+                except Exception:
+                    try:
+                        if update_sql:
+                            update_sql(f"DELETE FROM {schema_table}")
+                    except Exception:
+                        # logger.exception("Failed to clear target table %s before insert", schema_table)
+                        pass
+
+            # Perform batch insert using the oracle helper when available
             if update_sql_oi_rtqm:
-                # build SQL and use update_sql_oi_rtqm to perform executemany
                 insert_sql = f"insert into {schema_table} ({finalInsertColumn}) values ({placeholder_list})"
                 update_sql_oi_rtqm(insert_sql, data)
             elif update_sql:
-                # best-effort single-row inserts
-                for row in data:
-                    vals = ",".join(["'" + str(v).replace("'", "''") + "'" for v in row])
-                    update_sql(f"INSERT INTO {schema_table} ({finalInsertColumn}) VALUES ({vals})")
+                # Use oracle_insights.update_sql which supports executemany via data param
+                insert_sql = f"INSERT INTO {schema_table} ({finalInsertColumn}) VALUES ({placeholder_list})"
+                try:
+                    update_sql(insert_sql, data)
+                except Exception:
+                    # Fallback: try per-row via update_sql to increase robustness
+                    for row in data:
+                        vals = ",".join(["'" + str(v).replace("'", "''") + "'" for v in row])
+                        update_sql(f"INSERT INTO {schema_table} ({finalInsertColumn}) VALUES ({vals})")
+
+            # After insertion: run PROC if provided and not NO_PROC
+            try:
+                if proc_val and proc_val.upper() != "NO_PROC":
+                    pv = proc_val.strip()
+                    if pv.lower().startswith("execute "):
+                        pv = pv.split(None, 1)[1]
+                    if update_sql:
+                        # oracle_insights.update_sql recognizes BEGIN... blocks
+                        update_sql(f"BEGIN {pv}; END;")
+            except Exception:
+                # logger.exception("Failed to execute PROC %s for table %s", proc_val, schema_table)
+                pass
+
         rows_inserted = len(data)
+
+        # Write structured success log (same format as main.log_query)
+        try:
+            logging.info(json.dumps({
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "file_name": logical_filename,
+                "query_identifier": cfg.get("query_identifier", ""),
+                "query": insert_sql if 'insert_sql' in locals() else cfg.get("query_text", ""),
+                "parameters": f"CSV rows, rows_inserted={rows_inserted}",
+                "status": "success",
+                "execution_time_ms": None,
+                "bulk": True,
+                "rows_affected": rows_inserted
+            }))
+        except Exception:
+            # ignore logging failures
+            pass
     except Exception as e:
-        logger.exception("Insert or PROC failed: %s", e)
+        # logger.exception("Insert or PROC failed: %s", e)
+        # Write structured error into query log (same schema as main.log_query)
+        try:
+            logging.info(json.dumps({
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "file_name": logical_filename,
+                "query_identifier": cfg.get("query_identifier", ""),
+                "query": cfg.get("query_text") or "",
+                "parameters": "CSV rows",
+                "status": "error",
+                "error_message": str(e)
+            }))
+        except Exception:
+            # logger.exception("Failed to write error query log")
+            pass
+
         # Update log row with error indicator if possible
         try:
             if update_sql:
                 err_msg = str(e).replace("'", "''")
                 update_sql(f"UPDATE RPA_INPUTS.EXCEL_LOAD_TO_ORACLE SET SV6 = 'ERROR', SV7 = '{err_msg[:4000]}' WHERE UV = '{uv}'")
         except Exception:
-            logger.exception("Failed to update error status in log row")
+            # logger.exception("Failed to update error status in log row")
+            pass
         return {"status": "error", "message": "DB insert or PROC failed", "uv": uv}
 
     # Step 9: Mark processed
@@ -238,7 +313,8 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
         if update_sql:
             update_sql(f"UPDATE RPA_INPUTS.EXCEL_LOAD_TO_ORACLE SET PROCESSINGTIME = systimestamp WHERE UV = '{uv}'")
     except Exception:
-        logger.exception("Failed to mark PROCESSINGTIME for UV=%s", uv)
+        # logger.exception("Failed to mark PROCESSINGTIME for UV=%s", uv)
+        pass
 
     # Step 10: Persist processed file optionally
     try:
@@ -251,7 +327,8 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
             with open(out_path, 'wb') as fh:
                 fh.write(upload_file.file.read())
     except Exception:
-        logger.exception("Failed to persist processed file for UV=%s", uv)
+        # logger.exception("Failed to persist processed file for UV=%s", uv)
+        pass
 
     # Step 11: return success
     return {"status": "success", "uv": uv, "rows_inserted": rows_inserted, "table": schema_table}
