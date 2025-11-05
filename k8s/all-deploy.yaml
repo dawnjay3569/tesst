@@ -18,6 +18,11 @@ spec:
         - name: fapi
           image: fapi:latest
           imagePullPolicy: Never
+          envFrom:
+          - secretRef:
+              name: rpa-oracle
+          - configMapRef:
+              name: rpa-configs
           ports:
             - containerPort: 8000
           readinessProbe:

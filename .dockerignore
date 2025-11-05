@@ -7,3 +7,4 @@ packages_folder
 dist
 build
 .pytest_cache
+.env

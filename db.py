@@ -17,18 +17,18 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 if not DATABASE_URL:
     # Expect Oracle connection pieces via env vars
-    DB_DRIVER = os.getenv("DB_DRIVER", "oracle+oracledb")
-    DB_USER = os.getenv("DB_USER")
-    DB_PASS = os.getenv("DB_PASS")
-    DB_HOST = os.getenv("DB_HOST")
-    DB_PORT = os.getenv("DB_PORT")
-    DB_SERVICE = os.getenv("DB_SERVICE")
+    DB_DRIVER = "oracle+oracledb" # os.getenv("DB_DRIVER", "oracle+oracledb")
+    DB_USER = os.getenv("RPA_ORACLE_DB_USER")
+    DB_PASS = os.getenv("RPA_ORACLE_DB_PASSWORD")
+    DB_HOST = os.getenv("RPA_ORACLE_DB_HOST")
+    DB_PORT = os.getenv("RPA_ORACLE_DB_PORT")
+    DB_SERVICE = os.getenv("RPA_ORACLE_DB_SERVICE_NAME")
 
     if DB_USER and DB_PASS and DB_HOST and DB_PORT and DB_SERVICE:
         user_enc = quote_plus(DB_USER)
         pass_enc = quote_plus(DB_PASS)
         # Construct SQLAlchemy >=2 style URL for python-oracledb
-        url_driver = DB_DRIVER or "oracle+oracledb"
+        url_driver = DB_DRIVER # or "oracle+oracledb"
         DATABASE_URL = f"{url_driver}://{user_enc}:{pass_enc}@{DB_HOST}:{DB_PORT}/?service_name={DB_SERVICE}"
     else:
         raise RuntimeError(
