@@ -48,4 +48,5 @@ spec:
     - protocol: TCP
       port: 8000
       targetPort: 8000
+      nodePort: 32132
   type: NodePort  # for Minikube, this makes it reachable via minikube service

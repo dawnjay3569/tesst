@@ -183,7 +183,8 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
     else:
         df.columns = [_normalize_column_name(c) for c in df.columns]
 
-    df = df.fillna("").astype(str).applymap(lambda v: v.replace('\n', ' ').replace('\r', ' '))
+    # df = df.fillna("").astype(str).applymap(lambda v: v.replace('\n', ' ').replace('\r', ' '))
+    df = df.fillna("").astype(str).replace({r'[\n\r]+': ' '}, regex=True)
 
     # Step 6: Build insert payload
     cols_upper = [c.upper() for c in df.columns]
