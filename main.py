@@ -508,7 +508,7 @@ def logout(auth=Depends(authenticate)):
         logging.info("Logout called for subject=%s", subj)
     except Exception:
         logging.exception("Logout called but failed to read subject")
-    return {"status": "success", "message": "Logged out (token remains valid until expiry)"}
+    return {"status": "success", "message": "User Logged out"}
 
 
 @app.post("/registeruser")
