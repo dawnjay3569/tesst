@@ -1,9 +1,12 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Header
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 # sqlite3 was used previously for local DB; replaced by SQLAlchemy engine for generic DB support
 from sqlalchemy import text
 from db import get_engine, test_connection
+import jwt
+import tempfile
+from file_loader_api.common_lib.executive_mailer import send_email
 import json
 import uvicorn
 import logging
@@ -11,13 +14,19 @@ from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import os
+import uuid
+from passlib.context import CryptContext
 from fastapi.responses import JSONResponse
 from file_loader_api.file_loader_service import process_file_loader_job
 
 app = FastAPI(title="FAPI_QExec")
+
+# Password hashing context
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 
 # Load API keys
 with open("api_keys.json", "r", encoding="utf-8") as f:
@@ -25,10 +34,35 @@ with open("api_keys.json", "r", encoding="utf-8") as f:
 
 API_KEY_HEADER = APIKeyHeader(name="x-api-key", auto_error=False)
 
-def get_api_key(api_key_header: str = Depends(API_KEY_HEADER)):
+
+def authenticate(api_key_header: str = Depends(API_KEY_HEADER), authorization: str = Header(None)):
+    """Authenticate using Bearer JWT token (preferred) or x-api-key fallback.
+
+    Returns decoded JWT payload or API key string on success, otherwise raises 401.
+    """
+    # Try Authorization: Bearer <token>
+    if authorization:
+        try:
+            parts = authorization.split()
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                token = parts[1]
+                secret = os.getenv("JWT_SECRET", "change_me")
+                algo = os.getenv("JWT_ALGORITHM", "HS256")
+                payload = jwt.decode(token, secret, algorithms=[algo])
+                # No server-side revocation: rely solely on token expiry (exp claim)
+                return payload
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Invalid JWT token: {e}")
+
+    # Fallback to API key header if provided
     if api_key_header in _KEYS:
         return api_key_header
-    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+    raise HTTPException(status_code=401, detail="Invalid or missing credentials")
+
+
+# Note: token_blacklist / server-side revocation removed. Tokens are invalidated
+# only by their expiration (exp claim). Logout is a client-side operation.
 
 # Setup Logging
 LOG_FILE = "query_logs.log"
@@ -82,9 +116,25 @@ class ConfigExecuteRequest(BaseModel):
     bind_variables: Dict[str, Any]
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    roles: Optional[str] = None
+
+
 # SQL Type Detection
 def detect_sql_type(query: str) -> str:
     q = query.strip().lower()
+    # Support CTEs that start with WITH (treat as SELECT)
+    if q.startswith("with"):
+        return "select"
     if q.startswith("select"):
         return "select"
     elif q.startswith("insert"):
@@ -291,13 +341,13 @@ def run_generic_query(query: str, parameters: List[Any], options: QueryOptions, 
 def fetch_config_query(filename: str, query_identifier: str):
     engine = get_engine()
     with engine.connect() as conn:
-        res = conn.execute(text("SELECT query_text, bind_keys, table_name, proc, load_action FROM config_table WHERE filename = :f AND query_identifier = :q"), {"f": filename, "q": query_identifier})
+        res = conn.execute(text("SELECT query_text, bind_keys, table_name, proc, load_action, email FROM config_table WHERE filename = :f AND query_identifier = :q"), {"f": filename, "q": query_identifier})
         row = res.fetchone()
         if not row:
             return None
-        query_text, bind_keys, table_name_col, proc_col, load_action_col = row[0], row[1], row[2], row[3], row[4]
+        query_text, bind_keys, table_name_col, proc_col, load_action_col, email_col = row[0], row[1], row[2], row[3], row[4], row[5] if len(row) > 5 else None
 
-        cfg = {"query_text": query_text, "bind_keys": bind_keys, "TABLE_NAME": table_name_col, "PROC": proc_col, "LOAD_ACTION": load_action_col}
+        cfg = {"query_text": query_text, "bind_keys": bind_keys, "TABLE_NAME": table_name_col, "PROC": proc_col, "LOAD_ACTION": load_action_col, "email": email_col}
         return cfg
 
 
@@ -318,8 +368,50 @@ def validate_and_prepare_bind(bind_keys_csv: Optional[str], bind_variables: Dict
     return named_params
 
 
+def _send_result_via_email(cfg: Dict[str, Any], job: Dict[str, Any], result: Dict[str, Any]):
+    """Create a temp CSV with the result and send it to cfg['email'] if present.
+
+    This is best-effort: exceptions are logged but not raised to the caller.
+    """
+    try:
+        email_addr = cfg.get("email")
+        if not email_addr:
+            return
+
+        tf = tempfile.NamedTemporaryFile(delete=False, mode="w", newline="", encoding="utf-8", suffix=".csv")
+        try:
+            with tf as tmpf:
+                data = result.get("data", {})
+                cols = data.get("columns") or []
+                rows = data.get("rows") or []
+                writer = csv.writer(tmpf)
+                if cols:
+                    writer.writerow(cols)
+                    for r in rows:
+                        writer.writerow(["" if v is None else v for v in r])
+                else:
+                    writer.writerow(["job_filename", "query_identifier", "status", "row_count", "message"])
+                    writer.writerow([job.get("filename"), job.get("query_identifier"), result.get("status"), data.get("row_count"), data.get("message")])
+
+            # send email
+            try:
+                subject = f"Bulk job result: {job.get('filename')}:{job.get('query_identifier')}"
+                body = f"Bulk job completed. See attached CSV for details."
+                send_email(to=email_addr, cc="", subject=subject, body=body, attach_path=tf.name)
+                logging.info("Bulk job email sent to %s for %s:%s — attachment=%s", email_addr, job.get('filename'), job.get('query_identifier'), tf.name)
+            except Exception as e:
+                logging.exception("Failed to send bulk job email to %s: %s", email_addr, e)
+        finally:
+            try:
+                os.unlink(tf.name)
+            except Exception:
+                pass
+    except Exception:
+        logging.exception("Unexpected error preparing/sending bulk job email for %s:%s", job.get("filename"), job.get("query_identifier"))
+
+
 @app.post("/executeConfig")
-def execute_config(req: ConfigExecuteRequest, api_key: str = Depends(get_api_key)):
+def execute_config(req: ConfigExecuteRequest, auth=Depends(authenticate)):
     cfg = fetch_config_query(req.filename, req.query_identifier)
     if not cfg:
         raise HTTPException(status_code=404, detail="Configuration not found for given filename and query_identifier")
@@ -334,7 +426,137 @@ def execute_config(req: ConfigExecuteRequest, api_key: str = Depends(get_api_key
 
     # run_generic_query expects positional parameters list; but it accepts parameterized query too
     # We'll call the lower-level run to avoid re-parsing; use a tiny wrapper
-    return run_generic_query(cfg["query_text"], [], options, metadata) if not named_params else run_generic_query(cfg["query_text"], named_params, options, metadata)
+    result = run_generic_query(cfg["query_text"], [], options, metadata) if not named_params else run_generic_query(cfg["query_text"], named_params, options, metadata)
+
+    # If the configuration row contains an email address, send the result as a CSV attachment
+    try:
+        email_addr = cfg.get("email")
+        if email_addr and result and result.get("status") == "success":
+            # Create a temp CSV file with results (rows + columns) or a short summary
+            tf = tempfile.NamedTemporaryFile(delete=False, mode="w", newline="", encoding="utf-8", suffix=".csv")
+            try:
+                with tf as tmpf:
+                    data = result.get("data", {})
+                    cols = data.get("columns") or []
+                    rows = data.get("rows") or []
+                    writer = csv.writer(tmpf)
+                    if cols:
+                        writer.writerow(cols)
+                        for r in rows:
+                            # ensure each row is a flat sequence
+                            writer.writerow(["" if v is None else v for v in r])
+                    else:
+                        # write a short summary when no tabular data
+                        writer.writerow(["message", "row_count"])
+                        writer.writerow([data.get("message"), data.get("row_count")])
+
+                # send email with the temp file attached
+                try:
+                    send_email(to=email_addr, cc="", subject=f"Query result: {req.filename}:{req.query_identifier}", body="Please find attached the query result.", attach_path=tf.name)
+                    logging.info("Email sent to %s for config %s:%s — attachment=%s", email_addr, req.filename, req.query_identifier, tf.name)
+                except Exception as e:
+                    logging.exception("send_email failed: %s", e)
+            finally:
+                try:
+                    os.unlink(tf.name)
+                except Exception:
+                    pass
+    except Exception:
+        logging.exception("Error while preparing or sending email for config %s:%s", req.filename, req.query_identifier)
+
+    return result
+
+
+@app.post("/login")
+def login(req: LoginRequest):
+    """Authenticate user with username/password and return JWT token."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        res = conn.execute(text("SELECT username, password, roles FROM users WHERE username = :u"), {"u": req.username})
+        row = res.fetchone()
+        if not row:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        db_username, db_password, db_roles = row[0], row[1], row[2]
+        # verify password
+        try:
+            if not pwd_context.verify(req.password, db_password):
+                raise HTTPException(status_code=401, detail="Invalid username or password")
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    # create token
+    secret = os.getenv("JWT_SECRET", "change_me")
+    algo = os.getenv("JWT_ALGORITHM", "HS256")
+    expires_minutes = int(os.getenv("JWT_EXPIRES_MINUTES", "60"))
+    exp = datetime.utcnow() + timedelta(minutes=expires_minutes)
+    jti = str(uuid.uuid4())
+    payload = {"sub": db_username, "exp": exp, "jti": jti, "roles": db_roles}
+    token = jwt.encode(payload, secret, algorithm=algo)
+
+    return {"access_token": token, "token_type": "bearer", "expires_at": exp.isoformat() + "Z"}
+
+
+@app.post("/logout")
+def logout(auth=Depends(authenticate)):
+    """Logout endpoint — no server-side token revocation is performed.
+
+    Clients should discard the token. Tokens remain valid until their expiry.
+    """
+    # auth is the decoded payload; log the logout attempt for auditing
+    try:
+        subj = auth.get("sub") if isinstance(auth, dict) else None
+        logging.info("Logout called for subject=%s", subj)
+    except Exception:
+        logging.exception("Logout called but failed to read subject")
+    return {"status": "success", "message": "Logged out (token remains valid until expiry)"}
+
+
+@app.post("/registeruser")
+def register_user(req: RegisterRequest, api_key: str = Depends(API_KEY_HEADER)):
+    """Register a new user. Requires a valid `x-api-key` header from api_keys.json.
+
+    The endpoint hashes the provided password and stores the user in the `users` table.
+    Returns created user id on success.
+    """
+    if not api_key or api_key not in _KEYS:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            # Check username uniqueness
+            existing = conn.execute(text("SELECT 1 FROM users WHERE username = :u"), {"u": req.username}).fetchone()
+            if existing:
+                raise HTTPException(status_code=400, detail="Username already exists")
+
+            # Compute next id
+            row = conn.execute(text("SELECT MAX(id) FROM users")).fetchone()
+            next_id = (row[0] or 0) + 1
+
+            pw_hash = pwd_context.hash(req.password)
+
+            trans = conn.begin()
+            try:
+                conn.execute(
+                    text("INSERT INTO users (id, username, password, email, phone, roles) VALUES (:id, :u, :p, :e, :ph, :r)"),
+                    {"id": next_id, "u": req.username, "p": pw_hash, "e": req.email, "ph": req.phone, "r": req.roles},
+                )
+                trans.commit()
+            except Exception:
+                try:
+                    trans.rollback()
+                except Exception:
+                    pass
+                raise
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("Failed to register user: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to register user")
+
+    logging.info("User registered username=%s id=%s", req.username, next_id)
+    return {"status": "success", "user_id": next_id}
 
 
 @app.post("/executeConfigBulk")
@@ -346,7 +568,7 @@ def execute_config_bulk(
     bulk_insert: bool = Form(...),
     parallel: bool = Form(False),
     file_loader: bool = Form(False),
-    api_key: str = Depends(get_api_key),
+    api_key: str = Depends(authenticate),
 ):
     """
     Accepts multipart/form-data with fields:
@@ -511,9 +733,17 @@ def execute_config_bulk(
                             cfg["schema_table"] = m.group(1)
                     except Exception:
                         pass
-                    futures.append(ex.submit(process_file_loader_job, cfg, upload, job.get("filename")))
+                    # submit a wrapper that returns (job, cfg, result)
+                    futures.append(ex.submit(lambda c=cfg, u=upload, j=job: (j, c, process_file_loader_job(c, u, j.get("filename")))))
                 for f in as_completed(futures):
-                    results.append(f.result())
+                    job_obj, cfg_obj, res_obj = f.result()
+                    # attempt to email if configured
+                    try:
+                        if cfg_obj and cfg_obj.get("email") and res_obj and res_obj.get("status") == "success":
+                            _send_result_via_email(cfg_obj, job_obj, res_obj)
+                    except Exception:
+                        logging.exception("Error sending email for file_loader job %s:%s", job_obj.get("filename"), job_obj.get("query_identifier"))
+                    results.append(res_obj)
         else:
             for job, upload in zip(jobs_list, csv_files):
                 cfg = fetch_config_query(job.get("filename"), job.get("query_identifier"))
@@ -528,7 +758,13 @@ def execute_config_bulk(
                         cfg["schema_table"] = m.group(1)
                 except Exception:
                     pass
-                results.append(process_file_loader_job(cfg, upload, job.get("filename")))
+                res = process_file_loader_job(cfg, upload, job.get("filename"))
+                try:
+                    if cfg and cfg.get("email") and res and res.get("status") == "success":
+                        _send_result_via_email(cfg, job, res)
+                except Exception:
+                    logging.exception("Error sending email for file_loader job %s:%s", job.get("filename"), job.get("query_identifier"))
+                results.append(res)
         return JSONResponse(content={"results": results})
 
     # If file_loader flag is not set, fall back to original generic CSV-to-config bulk insert
@@ -538,27 +774,67 @@ def execute_config_bulk(
         with ThreadPoolExecutor(max_workers=min(4, len(jobs_list))) as ex:
             futures = []
             for job, upload in zip(jobs_list, csv_files):
-                futures.append(ex.submit(_process_job, job, upload))
+                # submit wrapper returning (job, result)
+                futures.append(ex.submit(lambda jb=job, up=upload: (jb, _process_job(jb, up))))
             for f in as_completed(futures):
-                results.append(f.result())
+                job_obj, res_obj = f.result()
+                # attempt to send email if configured for this job
+                try:
+                    cfg = fetch_config_query(job_obj.get("filename"), job_obj.get("query_identifier"))
+                    if cfg and cfg.get("email") and res_obj and res_obj.get("status") == "success":
+                        _send_result_via_email(cfg, job_obj, res_obj)
+                except Exception:
+                    logging.exception("Error sending email for bulk job %s:%s", job_obj.get("filename"), job_obj.get("query_identifier"))
+                results.append(res_obj)
     else:
         for job, upload in zip(jobs_list, csv_files):
-            results.append(_process_job(job, upload))
+            res = _process_job(job, upload)
+            try:
+                cfg = fetch_config_query(job.get("filename"), job.get("query_identifier"))
+                if cfg and cfg.get("email") and res and res.get("status") == "success":
+                    _send_result_via_email(cfg, job, res)
+            except Exception:
+                logging.exception("Error sending email for bulk job %s:%s", job.get("filename"), job.get("query_identifier"))
+            results.append(res)
 
     return JSONResponse(content={"results": results})
 
 
 # Final API Endpoint
 @app.post("/executeQuery")
-def execute_query(req: GenericQueryRequest, api_key: str = Depends(get_api_key)):
+def execute_query(req: GenericQueryRequest, auth=Depends(authenticate)):
     return run_generic_query(req.query, req.parameters, req.options, req.metadata)
 
 @app.get("/getallItems")
-def get_all_items(api_key: str = Depends(get_api_key)):
+def get_all_items(auth=Depends(authenticate)):
     query = "SELECT * FROM items"
     options = QueryOptions(readonly=True, track_performance=True)
     metadata = QueryMetadata(file_name="getallItems", query_identifier="GET_ALL_ITEMS")
     return run_generic_query(query, [], options, metadata)
+
+
+class TokenRequest(BaseModel):
+    subject: str
+    expires_minutes: Optional[int] = 60
+
+
+@app.post("/token")
+def create_token(req: TokenRequest, api_key: str = Depends(API_KEY_HEADER)):
+    """Create a short-lived JWT. Requires a valid x-api-key header from api_keys.json.
+
+    Request body: {"subject": "user@example.com", "expires_minutes": 60}
+    Returns: {"access_token": "...", "token_type": "bearer", "expires_at": "...Z"}
+    """
+    if not api_key or api_key not in _KEYS:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+    secret = os.getenv("JWT_SECRET", "change_me")
+    algo = os.getenv("JWT_ALGORITHM", "HS256")
+    exp = datetime.utcnow() + timedelta(minutes=(req.expires_minutes or 60))
+    payload = {"sub": req.subject, "exp": exp}
+    token = jwt.encode(payload, secret, algorithm=algo)
+
+    return {"access_token": token, "token_type": "bearer", "expires_at": exp.isoformat() + "Z"}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

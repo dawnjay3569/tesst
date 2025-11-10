@@ -281,4 +281,44 @@ python db_init.py
 
 Note: `db_init.py` executes `init_db.sql` using SQLAlchemy and assumes the `.env` contains the correct connection values. Do not commit your real `.env` with secrets — use `.env.example` for sharing.
 
+Additional recent changes
+------------------------
+
+- JWT authentication: the API accepts a Bearer JWT in the `Authorization` header (preferred) or the legacy `x-api-key` header as a fallback. Configure `JWT_SECRET` and optionally `JWT_ALGORITHM` (default HS256) via environment variables.
+
+- CTE support: queries that start with `WITH` (common table expressions) are treated as `SELECT` queries and accept named parameters like other parameterized queries.
+
+- Email notification: `config_table` now supports an `email` column. When the `/executeConfig` endpoint runs a configured query and the config row contains an email address, the server will generate a temporary CSV file of the result (or a short summary) and send it to that address using the included `executive_mailer` helper. The temp file is removed after sending.
+
+- Bulk-job email notifications: `/executeConfigBulk` also sends per-job email notifications when the corresponding `config_table` row contains an `email` address. Each successful job will generate a temporary CSV summary/rows file and send it as an attachment to the configured address.
+
+
+Authentication and user management (login/logout)
+------------------------------------------------
+
+- Database tables: `users` was added to `init_db.sql`. The `users` table stores `username`, hashed `password`, `email`, `phone`, and `roles`.
+
+- Login: POST `/login` accepts JSON {"username": "<user>", "password": "<password>"} and returns a JWT access token (Bearer). The token `exp` uses `JWT_EXPIRES_MINUTES` environment variable (default 60).
+
+- Logout: POST `/logout` (Bearer token required) is provided as a convenience auditing endpoint but does not perform server-side token revocation. Clients should discard tokens on logout; tokens remain valid until their `exp`.
+
+- Protected endpoints: All primary endpoints (`/executeQuery`, `/executeConfig`, `/executeConfigBulk`, etc.) validate the presented token signature and expiry. If you prefer API-key based access, you can still pass `x-api-key` as a fallback.
+
+Creating a user (example)
+-------------------------
+
+The repository does not expose a public user-creation endpoint by default. To create a user you can insert a row into `users` using a small Python helper to hash the password correctly. Example:
+
+```python
+from passlib.context import CryptContext
+from db import get_engine
+from sqlalchemy import text
+pwd = CryptContext(schemes=["bcrypt"]).hash("MyS3cret")
+engine = get_engine()
+with engine.connect() as conn:
+  conn.execute(text("INSERT INTO users (id, username, password, email, phone, roles) VALUES (:id, :u, :p, :e, :ph, :r)"), {"id": 1, "u": "alice", "p": pwd, "e":"alice@example.com", "ph":"+1000000000", "r":"admin"})
+```
+
+After creating the user, call the `/login` endpoint to obtain a JWT.
+
 
