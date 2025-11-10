@@ -46,7 +46,7 @@ def authenticate(api_key_header: str = Depends(API_KEY_HEADER), authorization: s
             parts = authorization.split()
             if len(parts) == 2 and parts[0].lower() == "bearer":
                 token = parts[1]
-                secret = os.getenv("JWT_SECRET", "change_me")
+                secret = os.getenv("JWT_SECRET", "qW#9zLp@K7mEr2!x")
                 algo = os.getenv("JWT_ALGORITHM", "HS256")
                 payload = jwt.decode(token, secret, algorithms=[algo])
                 # No server-side revocation: rely solely on token expiry (exp claim)
@@ -485,7 +485,7 @@ def login(req: LoginRequest):
             raise HTTPException(status_code=401, detail="Invalid username or password")
 
     # create token
-    secret = os.getenv("JWT_SECRET", "change_me")
+    secret = os.getenv("JWT_SECRET", "qW#9zLp@K7mEr2!x")
     algo = os.getenv("JWT_ALGORITHM", "HS256")
     expires_minutes = int(os.getenv("JWT_EXPIRES_MINUTES", "60"))
     exp = datetime.utcnow() + timedelta(minutes=expires_minutes)
@@ -828,7 +828,7 @@ def create_token(req: TokenRequest, api_key: str = Depends(API_KEY_HEADER)):
     if not api_key or api_key not in _KEYS:
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
-    secret = os.getenv("JWT_SECRET", "change_me")
+    secret = os.getenv("JWT_SECRET", "qW#9zLp@K7mEr2!x")
     algo = os.getenv("JWT_ALGORITHM", "HS256")
     exp = datetime.utcnow() + timedelta(minutes=(req.expires_minutes or 60))
     payload = {"sub": req.subject, "exp": exp}
