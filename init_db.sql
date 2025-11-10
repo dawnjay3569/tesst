@@ -13,5 +13,8 @@ CREATE TABLE config_table (
   bind_keys VARCHAR2(4000),
   table_name VARCHAR2(4000),
   proc VARCHAR2(4000),
-  load_action VARCHAR2(50)
+  load_action VARCHAR2(50),
+  email VARCHAR2(500),
+  owner VARCHAR2(255),
+  comments VARCHAR2(4000)
 );
