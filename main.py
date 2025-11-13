@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Hea
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 # sqlite3 was used previously for local DB; replaced by SQLAlchemy engine for generic DB support
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 from db import get_engine, test_connection
 import jwt
 import tempfile
@@ -75,6 +75,28 @@ logging.basicConfig(
 def log_query(details: Dict[str, Any]):
     log_entry = json.dumps(details)
     logging.info(log_entry)
+
+
+def _coerce_multi_value(v):
+    """Convert comma-separated strings into lists (with numeric coercion) for IN binds.
+
+    Returns None, scalar, or list.
+    """
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    if isinstance(v, str) and ',' in v:
+        parts = [s.strip() for s in v.split(',') if s.strip()]
+        def _conv(x):
+            if x.isdigit():
+                return int(x)
+            try:
+                return float(x)
+            except Exception:
+                return x
+        return [_conv(x) for x in parts]
+    return v
 
 
 # Startup: log which DB dialect is configured and a quick connection test
@@ -168,9 +190,10 @@ def run_generic_query(query: str, parameters: List[Any], options: QueryOptions, 
     conn = engine.connect()
 
     try:
-        # Detect bulk executemany: parameters is a list and its first element is a sequence or mapping
+        # Detect bulk executemany (list-of-dicts) or named-params (dict)
         params = parameters or []
         is_bulk = isinstance(params, list) and len(params) > 0 and isinstance(params[0], (list, tuple, dict))
+        is_named = isinstance(params, dict)
 
         if is_bulk and sql_type in ["insert", "update", "delete"]:
             # Bulk operation - use executemany via SQLAlchemy execution of text()
@@ -221,21 +244,42 @@ def run_generic_query(query: str, parameters: List[Any], options: QueryOptions, 
                 trans.rollback()
                 raise
 
-        # Single execute path
-        # For DML/DDL use an explicit transaction so changes are committed across dialects
-        if sql_type in ["insert", "update", "delete", "ddl"]:
-            trans = conn.begin()
-            try:
-                result = conn.execute(text(query), params if params else {})
-                trans.commit()
-            except Exception:
+        # Named-parameters path: support expanding list-valued binds using bindparam(..., expanding=True)
+        if is_named:
+            stmt = text(query)
+            for name, val in params.items():
+                if isinstance(val, (list, tuple)):
+                    stmt = stmt.bindparams(bindparam(name, expanding=True))
+
+            if sql_type in ["insert", "update", "delete", "ddl"]:
+                trans = conn.begin()
                 try:
-                    trans.rollback()
+                    result = conn.execute(stmt, params)
+                    trans.commit()
                 except Exception:
-                    pass
-                raise
+                    try:
+                        trans.rollback()
+                    except Exception:
+                        pass
+                    raise
+            else:
+                result = conn.execute(stmt, params)
         else:
-            result = conn.execute(text(query), params if params else {})
+            # Single execute path for positional params or empty params
+            # For DML/DDL use an explicit transaction so changes are committed across dialects
+            if sql_type in ["insert", "update", "delete", "ddl"]:
+                trans = conn.begin()
+                try:
+                    result = conn.execute(text(query), params if params else {})
+                    trans.commit()
+                except Exception:
+                    try:
+                        trans.rollback()
+                    except Exception:
+                        pass
+                    raise
+            else:
+                result = conn.execute(text(query), params if params else {})
 
         rows = []
         row_count = None
@@ -365,6 +409,8 @@ def validate_and_prepare_bind(bind_keys_csv: Optional[str], bind_variables: Dict
 
     # Prepare dict for named parameters (:key or :name)
     named_params = {k: bind_variables.get(k) for k in expected}
+    # Use top-level coercion helper to convert comma-separated values into lists
+    named_params = {k: _coerce_multi_value(v) for k, v in named_params.items()}
     return named_params
 
 
@@ -638,20 +684,48 @@ def execute_config_bulk(
             trans = conn.begin()
             chunk = []
             for i, row in enumerate(reader):
-                params = {k: (row.get(k) if row.get(k) != '' else None) for k in expected_keys}
+                params = {}
+                for k in expected_keys:
+                    raw = row.get(k)
+                    if raw is None or raw == '':
+                        params[k] = None
+                    else:
+                        params[k] = _coerce_multi_value(raw)
                 chunk.append(params)
 
                 if len(chunk) >= max(1, job_chunk):
-                    # executemany via SQLAlchemy: pass list of dicts
-                    conn.execute(text(cfg["query_text"]), chunk)
-                    rows_affected = len(chunk)
+                    # If any row contains list-valued params, execute those rows individually
+                    needs_expansion = any(any(isinstance(v, (list, tuple)) for v in item.values()) for item in chunk)
+                    if needs_expansion:
+                        for item in chunk:
+                            stmt = text(cfg["query_text"])
+                            for name, val in item.items():
+                                if isinstance(val, (list, tuple)):
+                                    stmt = stmt.bindparams(bindparam(name, expanding=True))
+                            conn.execute(stmt, item)
+                        rows_affected = len(chunk)
+                    else:
+                        # executemany via SQLAlchemy: pass list of dicts
+                        conn.execute(text(cfg["query_text"]), chunk)
+                        rows_affected = len(chunk)
+
                     total_rows += rows_affected
                     chunk_count += 1
                     chunk = []
 
             if len(chunk) > 0:
-                conn.execute(text(cfg["query_text"]), chunk)
-                rows_affected = len(chunk)
+                needs_expansion = any(any(isinstance(v, (list, tuple)) for v in item.values()) for item in chunk)
+                if needs_expansion:
+                    for item in chunk:
+                        stmt = text(cfg["query_text"])
+                        for name, val in item.items():
+                            if isinstance(val, (list, tuple)):
+                                stmt = stmt.bindparams(bindparam(name, expanding=True))
+                        conn.execute(stmt, item)
+                    rows_affected = len(chunk)
+                else:
+                    conn.execute(text(cfg["query_text"]), chunk)
+                    rows_affected = len(chunk)
                 total_rows += rows_affected
                 chunk_count += 1
 
