@@ -21,8 +21,17 @@ import uuid
 from passlib.context import CryptContext
 from fastapi.responses import JSONResponse
 from file_loader_api.file_loader_service import process_file_loader_job
-
+from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="FAPI_QExec")
+
+# added CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or specific domains like ["http://localhost:3000"]
+    allow_credentials=True,
+    allow_methods=["*"],  # or ["GET", "POST"]
+    allow_headers=["*"],  # or ["Authorization", "Content-Type"]
+)
 
 # Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

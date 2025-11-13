@@ -8,11 +8,11 @@ from email.mime.application import MIMEApplication
 import os
 import smtplib
 import sys
-from RPA_MODULES.common_lib.logging_config import get_logger
+#from RPA_MODULES.common_lib.logging_config import get_logger
 
 load_dotenv()
 # Get a logger for this script
-logger = get_logger("executive_mailer.py")
+#logger = get_logger("executive_mailer.py")
 IS_TEST=os.getenv("EXECUTIVE_MAILER_IS_TEST").lower()=="true"
 TEST_EMAIL=os.getenv("EXECUTIVE_MAILER_TEST_EMAIL")
 
