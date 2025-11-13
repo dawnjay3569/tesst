@@ -23,20 +23,20 @@ set_rpa_workflow_name(os.getenv("RPA_NAME")) # This should be set from the argo 
 set_rpa_argo_workflow_name(os.getenv("ARGO_WORKFLOW_NAME")) # This should be set from the argo workflow with environment variable
 set_rpa_workflow_run_guid(os.getenv("RPA_RUN_GUID")) # This should be set from the argo workflow with environment variable
 
-DB_HOST = os.getenv("RPA_ORACLE_DB_HOST")
-DB_PORT = os.getenv("RPA_ORACLE_DB_PORT")
-DB_SERVICE_NAME = os.getenv("RPA_ORACLE_DB_SERVICE_NAME")
-DB_USERNAME = os.getenv("RPA_ORACLE_DB_USER")
-DB_PASSWORD = os.getenv("RPA_ORACLE_DB_PASSWORD")
+DB_HOST = os.getenv("INSIGHTS_ORACLE_DB_HOST")
+DB_PORT = os.getenv("INSIGHTS_ORACLE_DB_PORT")
+DB_SERVICE_NAME = os.getenv("INSIGHTS_ORACLE_DB_SERVICE_NAME")
+DB_USERNAME = os.getenv("INSIGHTS_ORACLE_DB_USER")
+DB_PASSWORD = os.getenv("INSIGHTS_ORACLE_DB_PASSWORD")
 
 REDIS_HOST = os.getenv("RPA_REDIS_HOST")
 REDIS_PORT = int(os.getenv("RPA_REDIS_PORT"))
 REDIS_DB = int(os.getenv("RPA_REDIS_DB"))
 
 OLD_RPA_MODULE_SCHEMA = "OI_RTQM_L1"
-NEW_RPA_MODULE_SCHEMA = os.getenv("RPA_ORACLE_DB_USER") # This should be the schema where the new RPA module procedures are stored
+NEW_RPA_MODULE_SCHEMA = os.getenv("INSIGHTS_ORACLE_DB_USER") # This should be the schema where the new RPA module procedures are stored
 
-# NEW_RPA_MODULE_SCHEMA = "OI_RTQM_L1"#os.getenv("RPA_ORACLE_DB_USER") # This should be the schema where the new RPA module procedures are stored
+# NEW_RPA_MODULE_SCHEMA = "OI_RTQM_L1"#os.getenv("INSIGHTS_ORACLE_DB_USER") # This should be the schema where the new RPA module procedures are stored
 
 class DataLoadMode(Enum):
     NO_LOAD = 0 # Grand queries are not run, only the stored procedure is executed

@@ -12,12 +12,12 @@ from sqlalchemy import create_engine, text
 load_dotenv()
 
 # Prefer the standard DB_* variables used across this repo (see db.py),
-# but keep backward compatibility with existing RPA_ORACLE_* names.
-DB_HOST = os.getenv("DB_HOST") or os.getenv("RPA_ORACLE_DB_HOST")
-DB_PORT_STR = os.getenv("DB_PORT") or os.getenv("RPA_ORACLE_DB_PORT")
-DB_SERVICE_NAME = os.getenv("DB_SERVICE") or os.getenv("RPA_ORACLE_DB_SERVICE_NAME")
-DB_USERNAME = os.getenv("DB_USER") or os.getenv("RPA_ORACLE_DB_USER")
-DB_PASSWORD = os.getenv("DB_PASS") or os.getenv("RPA_ORACLE_DB_PASSWORD")
+# but keep backward compatibility with existing INSIGHTS_ORACLE_* names.
+DB_HOST = os.getenv("DB_HOST") or os.getenv("INSIGHTS_ORACLE_DB_HOST")
+DB_PORT_STR = os.getenv("DB_PORT") or os.getenv("INSIGHTS_ORACLE_DB_PORT")
+DB_SERVICE_NAME = os.getenv("DB_SERVICE") or os.getenv("INSIGHTS_ORACLE_DB_SERVICE_NAME")
+DB_USERNAME = os.getenv("DB_USER") or os.getenv("INSIGHTS_ORACLE_DB_USER")
+DB_PASSWORD = os.getenv("DB_PASS") or os.getenv("INSIGHTS_ORACLE_DB_PASSWORD")
 
 try:
     DB_PORT = int(DB_PORT_STR) if DB_PORT_STR else 1521

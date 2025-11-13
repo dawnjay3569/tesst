@@ -11,12 +11,12 @@ from RPA_MODULES.common_lib.logging_config import get_logger
 
 load_dotenv()
 
-# Prefer standard DB_* vars (see db.py), with fallback to legacy RPA_ORACLE_* names
-DB_HOST = os.getenv("DB_HOST") or os.getenv("RPA_ORACLE_DB_HOST")
-DB_PORT_STR = os.getenv("DB_PORT") or os.getenv("RPA_ORACLE_DB_PORT")
-DB_SERVICE_NAME = os.getenv("DB_SERVICE") or os.getenv("RPA_ORACLE_DB_SERVICE_NAME")
-DB_USERNAME = os.getenv("DB_USER") or os.getenv("RPA_ORACLE_DB_USER")
-DB_PASSWORD = os.getenv("DB_PASS") or os.getenv("RPA_ORACLE_DB_PASSWORD")
+# Prefer standard DB_* vars (see db.py), with fallback to legacy INSIGHTS_ORACLE_* names
+DB_HOST = os.getenv("DB_HOST") or os.getenv("INSIGHTS_ORACLE_DB_HOST")
+DB_PORT_STR = os.getenv("DB_PORT") or os.getenv("INSIGHTS_ORACLE_DB_PORT")
+DB_SERVICE_NAME = os.getenv("DB_SERVICE") or os.getenv("INSIGHTS_ORACLE_DB_SERVICE_NAME")
+DB_USERNAME = os.getenv("DB_USER") or os.getenv("INSIGHTS_ORACLE_DB_USER")
+DB_PASSWORD = os.getenv("DB_PASS") or os.getenv("INSIGHTS_ORACLE_DB_PASSWORD")
 
 try:
     DB_PORT = int(DB_PORT_STR) if DB_PORT_STR else 1521

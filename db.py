@@ -18,11 +18,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     # Expect Oracle connection pieces via env vars
     DB_DRIVER = "oracle+oracledb" # os.getenv("DB_DRIVER", "oracle+oracledb")
-    DB_USER = os.getenv("RPA_ORACLE_DB_USER")
-    DB_PASS = os.getenv("RPA_ORACLE_DB_PASSWORD")
-    DB_HOST = os.getenv("RPA_ORACLE_DB_HOST")
-    DB_PORT = os.getenv("RPA_ORACLE_DB_PORT")
-    DB_SERVICE = os.getenv("RPA_ORACLE_DB_SERVICE_NAME")
+    DB_USER = os.getenv("INSIGHTS_ORACLE_DB_USER")
+    DB_PASS = os.getenv("INSIGHTS_ORACLE_DB_PASSWORD")
+    DB_HOST = os.getenv("INSIGHTS_ORACLE_DB_HOST")
+    DB_PORT = os.getenv("INSIGHTS_ORACLE_DB_PORT")
+    DB_SERVICE = os.getenv("INSIGHTS_ORACLE_DB_SERVICE_NAME")
 
     if DB_USER and DB_PASS and DB_HOST and DB_PORT and DB_SERVICE:
         user_enc = quote_plus(DB_USER)
