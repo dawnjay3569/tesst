@@ -8,6 +8,7 @@ import jwt
 import tempfile
 from file_loader_api.common_lib.executive_mailer import send_email
 import json
+import re
 import uvicorn
 import logging
 from typing import List, Dict, Any, Optional
@@ -86,25 +87,74 @@ def log_query(details: Dict[str, Any]):
     logging.info(log_entry)
 
 
-def _coerce_multi_value(v):
-    """Convert comma-separated strings into lists (with numeric coercion) for IN binds.
+def _bind_used_in_in_clause(query: Optional[str], bind_name: str) -> bool:
+    """Detect whether `:bind_name` is used in an IN clause in the query.
 
-    Returns None, scalar, or list.
+    Handles patterns like `IN :bind`, `IN(:bind)`, or `IN (:bind)` (case-insensitive).
+    """
+    if not query or not bind_name:
+        return False
+    # Look for IN :bind or IN(:bind) patterns
+    try:
+        # pattern1: IN :bind or IN : bind
+        p1 = re.compile(r"\bIN\s*:\s*" + re.escape(bind_name) + r"\b", re.IGNORECASE)
+        # pattern2: IN\s*\(\s*:\s*bind\s*\)
+        p2 = re.compile(r"\bIN\s*\(\s*:\s*" + re.escape(bind_name) + r"\s*\)", re.IGNORECASE)
+        return bool(p1.search(query) or p2.search(query))
+    except Exception:
+        return False
+
+
+def _coerce_multi_value(v, bind_name: Optional[str] = None, query_text: Optional[str] = None, force_list: bool = False):
+    """Convert inputs into appropriate Python values for binding.
+
+    - If v is a list/tuple returns list(v).
+    - If v is a JSON-array string, parse it.
+    - If v is a comma-separated string, split into list and coerce numerics.
+    - If v is a scalar string and force_list is True (or the bind is used in an IN clause), wrap into [v].
+
+    This makes IN binds robust: both single value and multi-value inputs work.
     """
     if v is None:
         return None
+    # Already a list/tuple -> return as list
     if isinstance(v, (list, tuple)):
         return list(v)
-    if isinstance(v, str) and ',' in v:
-        parts = [s.strip() for s in v.split(',') if s.strip()]
-        def _conv(x):
-            if x.isdigit():
-                return int(x)
+
+    # If it's a string, try to interpret
+    if isinstance(v, str):
+        s = v.strip()
+        # If looks like a JSON array, try to parse
+        if s.startswith("[") and s.endswith("]"):
             try:
-                return float(x)
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return parsed
             except Exception:
-                return x
-        return [_conv(x) for x in parts]
+                pass
+
+        # comma separated -> split
+        if "," in s:
+            parts = [p.strip() for p in s.split(",") if p.strip()]
+            def _conv(x):
+                if x.isdigit():
+                    return int(x)
+                try:
+                    return float(x)
+                except Exception:
+                    return x
+            return [_conv(x) for x in parts]
+
+        # if bind used in IN clause or force_list requested, wrap scalar
+        if force_list or _bind_used_in_in_clause(query_text, bind_name or ""):
+            return [s]
+
+        # otherwise return scalar string
+        return s
+
+    # Non-string, non-list values (numbers etc.) — if force_list wrap
+    if force_list:
+        return [v]
     return v
 
 
@@ -418,9 +468,18 @@ def validate_and_prepare_bind(bind_keys_csv: Optional[str], bind_variables: Dict
 
     # Prepare dict for named parameters (:key or :name)
     named_params = {k: bind_variables.get(k) for k in expected}
-    # Use top-level coercion helper to convert comma-separated values into lists
-    named_params = {k: _coerce_multi_value(v) for k, v in named_params.items()}
-    return named_params
+    # Use top-level coercion helper to convert values into lists when appropriate
+    coerced = {}
+    for k, v in named_params.items():
+        # determine if this bind appears in an IN clause in the provided query_text
+        # query_text will be passed by callers when available; default to None
+        query_text = None
+        # attempt to get query_text from bind_variables special key '_query_text' if provided
+        # but callers should pass the query_text explicitly to validate_and_prepare_bind when possible
+        if isinstance(bind_variables, dict) and "_query_text" in bind_variables:
+            query_text = bind_variables.get("_query_text")
+        coerced[k] = _coerce_multi_value(v, bind_name=k, query_text=query_text)
+    return coerced
 
 
 def _send_result_via_email(cfg: Dict[str, Any], job: Dict[str, Any], result: Dict[str, Any]):
@@ -472,7 +531,12 @@ def execute_config(req: ConfigExecuteRequest, auth=Depends(authenticate)):
         raise HTTPException(status_code=404, detail="Configuration not found for given filename and query_identifier")
 
     # Validate bind keys and prepare named params
-    named_params = validate_and_prepare_bind(cfg.get("bind_keys"), req.bind_variables or {})
+    # Pass query_text to let the validator detect IN-clause binds and wrap scalars as needed
+    bind_vars = req.bind_variables or {}
+    # include query_text as a transient key so validate_and_prepare_bind can inspect it
+    bind_vars_with_query = dict(bind_vars)
+    bind_vars_with_query["_query_text"] = cfg.get("query_text")
+    named_params = validate_and_prepare_bind(cfg.get("bind_keys"), bind_vars_with_query)
 
     # Execute the fetched query using run_generic_query infrastructure
     # We use the same options/metadata defaults
@@ -699,7 +763,8 @@ def execute_config_bulk(
                     if raw is None or raw == '':
                         params[k] = None
                     else:
-                        params[k] = _coerce_multi_value(raw)
+                        # coerce using query context so IN binds get a list even for single values
+                        params[k] = _coerce_multi_value(raw, bind_name=k, query_text=cfg.get("query_text"))
                 chunk.append(params)
 
                 if len(chunk) >= max(1, job_chunk):

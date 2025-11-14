@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: fapi
+  namespace: rpa-job-prod
   labels:
     app: fapi
 spec:
@@ -20,7 +21,7 @@ spec:
           imagePullPolicy: Never
           envFrom:
           - secretRef:
-              name: rpa-oracle
+              name: insights-db
           - configMapRef:
               name: rpa-configs
           ports:
@@ -44,6 +45,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: fapi-service
+  namespace: rpa-job-prod
   labels:
     app: fapi
 spec:
