@@ -225,10 +225,18 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
 
             # TRUNCATE (or DELETE fallback) before insert if requested
             if load_action_upper == "TRUNCATE":
+                # Procedure expects the unqualified table name only
+                table_only = str(schema_table).split('.')[-1].strip().strip('"')
                 try:
                     if update_sql:
-                        update_sql(f"TRUNCATE TABLE {schema_table}")
+                        try:
+                            # Preferred form: EXEC the truncate proc with table name
+                            update_sql(f"EXEC OI_RTQM.truncate_my_table('{table_only}')")
+                        except Exception:
+                            # Fallback to anonymous PL/SQL block which works with many drivers
+                            update_sql(f"BEGIN OI_RTQM.truncate_my_table('{table_only}'); END;")
                 except Exception:
+                    # If proc-based truncate fails, fall back to DELETE FROM as last resort
                     try:
                         if update_sql:
                             update_sql(f"DELETE FROM {schema_table}")

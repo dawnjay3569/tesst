@@ -149,7 +149,18 @@ def write_to_destination(df, query_config) -> None:
     try:
         cursor = conn.cursor()
         if insert_method == "truncate":
-            cursor.execute(f"TRUNCATE TABLE OI_RTQM.{query_key}")
+            # Procedure expects unqualified table name only. Use callproc when possible.
+            table_only = str(query_key).split('.')[-1].strip().strip('"')
+            try:
+                # Preferred: call the stored procedure directly
+                cursor.callproc("OI_RTQM.truncate_my_table", [table_only])
+            except Exception:
+                try:
+                    # Fallback to anonymous PL/SQL block
+                    cursor.execute(f"BEGIN OI_RTQM.truncate_my_table('{table_only}'); END;")
+                except Exception:
+                    # Last resort: try TRUNCATE TABLE
+                    cursor.execute(f"TRUNCATE TABLE OI_RTQM.{query_key}")
 
         # Clean DataFrame
         df = df.fillna("").map(str).replace("NaT", "")

@@ -34,7 +34,13 @@ set_rpa_workflow_run_guid(os.getenv("RPA_RUN_GUID")) # This should be set from t
 def insert_to_oi_rtqm(data_to_insert, placeholder_list, table_columns, schema_table, action=None, load_action=''):
     try:
         if not str(schema_table).startswith("RPA_INPUTS"):
-            update_sql_oi_rtqm("TRUNCATE TABLE {0}".format(schema_table))
+            # Call the truncate procedure with unqualified table name
+            table_only = str(schema_table).split('.')[-1].strip().strip('"')
+            try:
+                update_sql_oi_rtqm(f"EXEC OI_RTQM.truncate_my_table('{table_only}')")
+            except Exception:
+                # Fallback to PL/SQL anonymous block
+                update_sql_oi_rtqm(f"BEGIN OI_RTQM.truncate_my_table('{table_only}'); END;")
         update_sql_oi_rtqm("insert into " + str(schema_table) + "(" + str(table_columns) +
                            ") values ({value_placeholder_list})".format(value_placeholder_list=placeholder_list),
                            data_to_insert)
