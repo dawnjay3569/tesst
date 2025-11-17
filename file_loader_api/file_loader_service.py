@@ -229,11 +229,6 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
                 table_only = str(schema_table).split('.')[-1].strip().strip('"')
                 try:
                     if update_sql:
-                        try:
-                            # Preferred form: EXEC the truncate proc with table name
-                            update_sql(f"EXEC OI_RTQM.truncate_my_table('{table_only}')")
-                        except Exception:
-                            # Fallback to anonymous PL/SQL block which works with many drivers
                             update_sql(f"BEGIN OI_RTQM.truncate_my_table('{table_only}'); END;")
                 except Exception:
                     # If proc-based truncate fails, fall back to DELETE FROM as last resort
