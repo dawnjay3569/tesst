@@ -5,12 +5,16 @@ from pydantic import BaseModel
 from sqlalchemy import text, bindparam
 from db import get_engine, test_connection
 import jwt
+from jwt import ExpiredSignatureError, InvalidTokenError
 import tempfile
 from file_loader_api.common_lib.executive_mailer import send_email
 import json
 import re
 import uvicorn
 import logging
+from logging.handlers import RotatingFileHandler
+import secrets
+import string
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
@@ -58,9 +62,17 @@ def authenticate(api_key_header: str = Depends(API_KEY_HEADER), authorization: s
                 token = parts[1]
                 secret = os.getenv("JWT_SECRET", "qW#9zLp@K7mEr2!x")
                 algo = os.getenv("JWT_ALGORITHM", "HS256")
-                payload = jwt.decode(token, secret, algorithms=[algo])
+                try:
+                    payload = jwt.decode(token, secret, algorithms=[algo])
+                except ExpiredSignatureError:
+                    # Provide a clear message that token expired and client should re-login
+                    raise HTTPException(status_code=401, detail="Token expired, please re-login")
+                except InvalidTokenError as e:
+                    raise HTTPException(status_code=401, detail=f"Invalid JWT token: {e}")
                 # No server-side revocation: rely solely on token expiry (exp claim)
                 return payload
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=401, detail=f"Invalid JWT token: {e}")
 
@@ -74,13 +86,20 @@ def authenticate(api_key_header: str = Depends(API_KEY_HEADER), authorization: s
 # Note: token_blacklist / server-side revocation removed. Tokens are invalidated
 # only by their expiration (exp claim). Logout is a client-side operation.
 
-# Setup Logging
-LOG_FILE = "query_logs.log"
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format='%(message)s'
-)
+# Setup Logging with rotation
+LOG_FILE = os.getenv("LOG_FILE", "query_logs.log")
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))  # 5MB default
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+rot_handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
+rot_handler.setFormatter(logging.Formatter('%(message)s'))
+root_logger.addHandler(rot_handler)
+# ensure console output during development
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+root_logger.addHandler(console_handler)
 
 def log_query(details: Dict[str, Any]):
     log_entry = json.dumps(details)
@@ -607,12 +626,32 @@ def login(req: LoginRequest):
     secret = os.getenv("JWT_SECRET", "qW#9zLp@K7mEr2!x")
     algo = os.getenv("JWT_ALGORITHM", "HS256")
     expires_minutes = int(os.getenv("JWT_EXPIRES_MINUTES", "60"))
-    exp = datetime.utcnow() + timedelta(minutes=expires_minutes)
+    exp_dt = datetime.utcnow() + timedelta(minutes=expires_minutes)
+    exp_ts = int(exp_dt.timestamp())
     jti = str(uuid.uuid4())
-    payload = {"sub": db_username, "exp": exp, "jti": jti, "roles": db_roles}
+    # Normalize roles into a JSON array in the token
+    roles_list = []
+    try:
+        if isinstance(db_roles, str):
+            s = db_roles.strip()
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    roles_list = json.loads(s)
+                except Exception:
+                    roles_list = [r.strip() for r in s.split(",") if r.strip()]
+            elif "," in s:
+                roles_list = [r.strip() for r in s.split(",") if r.strip()]
+            elif s:
+                roles_list = [s]
+        elif isinstance(db_roles, (list, tuple)):
+            roles_list = list(db_roles)
+    except Exception:
+        roles_list = []
+
+    payload = {"sub": db_username, "exp": exp_ts, "exp_human": exp_dt.isoformat() + "Z", "jti": jti, "roles": roles_list}
     token = jwt.encode(payload, secret, algorithm=algo)
 
-    return {"access_token": token, "token_type": "bearer", "expires_at": exp.isoformat() + "Z"}
+    return {"access_token": token, "token_type": "bearer", "expires_at": exp_dt.isoformat() + "Z"}
 
 
 @app.post("/logout")
@@ -676,6 +715,89 @@ def register_user(req: RegisterRequest, api_key: str = Depends(API_KEY_HEADER)):
 
     logging.info("User registered username=%s id=%s", req.username, next_id)
     return {"status": "success", "user_id": next_id}
+
+
+@app.get("/profile/{username}")
+def get_profile(username: str, auth=Depends(authenticate)):
+    """Return user profile (all fields except password). Protected route.
+
+    If auth is a JWT payload, allow access if caller is the same user or has 'admin' role.
+    If auth is an API key, allow access.
+    """
+    # determine caller identity
+    caller = None
+    caller_roles = []
+    if isinstance(auth, dict):
+        caller = auth.get("sub")
+        caller_roles = auth.get("roles") or []
+
+    # if caller is not the same user and not admin, deny
+    if caller and caller != username and "admin" not in (caller_roles or []):
+        raise HTTPException(status_code=403, detail="Forbidden: insufficient privileges")
+
+    engine = get_engine()
+    with engine.connect() as conn:
+        res = conn.execute(text("SELECT id, username, email, phone, roles, created_at FROM users WHERE username = :u"), {"u": username})
+        row = res.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        # Map row to dict without password
+        keys = ["id", "username", "email", "phone", "roles", "created_at"]
+        return {k: row[i] for i, k in enumerate(keys)}
+
+
+class ForgotPasswordRequest(BaseModel):
+    username: str
+    email: str
+
+
+@app.post("/forgot_password")
+def forgot_password(req: ForgotPasswordRequest, api_key: str = Depends(API_KEY_HEADER)):
+    """Generate a new temporary 8-character password for the user and email it.
+
+    Requires a valid API key (to avoid abuse). Verifies username and email match.
+    """
+    if not api_key or api_key not in _KEYS:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+    engine = get_engine()
+    with engine.connect() as conn:
+        res = conn.execute(text("SELECT id, username, email FROM users WHERE username = :u"), {"u": req.username})
+        row = res.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Username not found")
+        db_email = row[2]
+        if not db_email or db_email.strip().lower() != req.email.strip().lower():
+            raise HTTPException(status_code=400, detail="Username and email do not match")
+
+        # generate an 8-character password (alphanumeric)
+        alphabet = string.ascii_letters + string.digits
+        new_password = ''.join(secrets.choice(alphabet) for _ in range(8))
+        pw_hash = pwd_context.hash(new_password)
+
+        # update password in DB
+        trans = conn.begin()
+        try:
+            conn.execute(text("UPDATE users SET password = :p WHERE username = :u"), {"p": pw_hash, "u": req.username})
+            trans.commit()
+        except Exception:
+            try:
+                trans.rollback()
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail="Failed to update password")
+
+    # Send email with temporary password
+    try:
+        subject = "Password reset"
+        body = f"Your temporary password is: {new_password}\nPlease login and change your password immediately."
+        send_email(to=req.email, cc="", subject=subject, body=body, attach_path=None)
+    except Exception as e:
+        logging.exception("Failed to send forgot-password email to %s: %s", req.email, e)
+        # don't leak sensitive failure details to client
+        raise HTTPException(status_code=500, detail="Failed to send email with new password")
+
+    return {"status": "success", "message": "Temporary password generated and emailed"}
 
 
 @app.post("/executeConfigBulk")

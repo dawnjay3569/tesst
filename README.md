@@ -322,3 +322,17 @@ with engine.connect() as conn:
 After creating the user, call the `/login` endpoint to obtain a JWT.
 
 
+New endpoints and behaviors (recent additions)
+---------------------------------------------
+
+- GET `/profile/{username}` (protected): returns the user profile for the given username (id, username, email, phone, roles, created_at) but does NOT return the password. Requires a valid Bearer token or a valid API key; normal users may only retrieve their own profile unless they have the `admin` role.
+
+- POST `/forgot_password` (protected by `x-api-key`): accepts JSON {"username": "...", "email": "..."}. If the username exists and the email matches the stored address, the API generates a random 8-character temporary password, hashes and stores it in the `users` table, and emails the temporary password to the user. The user must login and change the password after first use.
+
+- Token expiry and human-readable times: JWT tokens now include an `exp` numeric timestamp and an `exp_human` ISO-8601 string in the payload. Responses that return `expires_at` use the human-readable ISO string. When a token has expired the API responds with HTTP 401 and the message "Token expired, please re-login".
+
+- Rotating logs: server logging now uses a rotating file handler. Configure `LOG_FILE`, `LOG_MAX_BYTES`, and `LOG_BACKUP_COUNT` via environment variables to control rotation. Default: `query_logs.log`, 5MB max, 5 backups.
+
+These changes were added to improve observability, user self-service flows, and production readiness.
+
+
