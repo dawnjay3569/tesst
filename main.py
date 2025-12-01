@@ -627,7 +627,7 @@ def login(req: LoginRequest):
     algo = os.getenv("JWT_ALGORITHM", "HS256")
     expires_minutes = int(os.getenv("JWT_EXPIRES_MINUTES", "60"))
     exp_dt = datetime.utcnow() + timedelta(minutes=expires_minutes)
-    exp_ts = int(exp_dt.timestamp())
+    exp_ts = exp_dt
     jti = str(uuid.uuid4())
     # Normalize roles into a JSON array in the token
     roles_list = []
@@ -681,7 +681,7 @@ def register_user(req: RegisterRequest, api_key: str = Depends(API_KEY_HEADER)):
 
     engine = get_engine()
     try:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             # Check username uniqueness
             existing = conn.execute(text("SELECT 1 FROM users WHERE username = :u"), {"u": req.username}).fetchone()
             if existing:
@@ -693,19 +693,19 @@ def register_user(req: RegisterRequest, api_key: str = Depends(API_KEY_HEADER)):
 
             pw_hash = pwd_context.hash(req.password)
 
-            trans = conn.begin()
+            #trans = conn.begin()
             try:
                 conn.execute(
                     text("INSERT INTO users (id, username, password, email, phone, roles) VALUES (:id, :u, :p, :e, :ph, :r)"),
                     {"id": next_id, "u": req.username, "p": pw_hash, "e": req.email, "ph": req.phone, "r": req.roles},
                 )
-                trans.commit()
+             #   trans.commit()
             except Exception:
-                try:
-                    trans.rollback()
-                except Exception:
+            #     try:
+            #   #      trans.rollback()
+            #     except Exception:
                     pass
-                raise
+                # raise
 
     except HTTPException:
         raise
@@ -737,12 +737,12 @@ def get_profile(username: str, auth=Depends(authenticate)):
 
     engine = get_engine()
     with engine.connect() as conn:
-        res = conn.execute(text("SELECT id, username, email, phone, roles, created_at FROM users WHERE username = :u"), {"u": username})
+        res = conn.execute(text("SELECT username, email, phone, roles FROM users WHERE username = :u"), {"u": username})
         row = res.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="User not found")
         # Map row to dict without password
-        keys = ["id", "username", "email", "phone", "roles", "created_at"]
+        keys = [ "username", "email", "phone", "roles"]
         return {k: row[i] for i, k in enumerate(keys)}
 
 
