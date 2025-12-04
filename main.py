@@ -818,7 +818,7 @@ def logout(auth=Depends(authenticate)):
         subj = auth.get("sub") if isinstance(auth, dict) else None
         #  logger.info("Logout called for subject=%s", subj)
     except Exception:
-        # logger.exception("Logout called but failed to read subject")
+        logger.exception("Logout called but failed to read subject")
     return {"status": "success", "message": "User Logged out"}
 
 
