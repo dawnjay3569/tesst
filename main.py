@@ -34,6 +34,7 @@ from passlib.context import CryptContext
 from fastapi.responses import JSONResponse
 from file_loader_api.file_loader_service import process_file_loader_job
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 app = FastAPI(title="FAPI_QExec")
 
 # added CORS
@@ -490,13 +491,13 @@ def run_generic_query(query: str, parameters: List[Any], options: QueryOptions, 
 def fetch_config_query(filename: str, query_identifier: str):
     engine = get_engine()
     with engine.connect() as conn:
-        res = conn.execute(text("SELECT query_text, bind_keys, table_name, proc, load_action, email FROM config_table WHERE filename = :f AND query_identifier = :q"), {"f": filename, "q": query_identifier})
+        res = conn.execute(text("SELECT query_text, bind_keys, table_name, proc, load_action, email, argocfg FROM config_table WHERE filename = :f AND query_identifier = :q"), {"f": filename, "q": query_identifier})
         row = res.fetchone()
         if not row:
             return None
-        query_text, bind_keys, table_name_col, proc_col, load_action_col, email_col = row[0], row[1], row[2], row[3], row[4], row[5] if len(row) > 5 else None
+        query_text, bind_keys, table_name_col, proc_col, load_action_col, email_col,argocfg = row[0], row[1], row[2], row[3], row[4], row[5], row[6] if len(row) > 5 else None
 
-        cfg = {"query_text": query_text, "bind_keys": bind_keys, "TABLE_NAME": table_name_col, "PROC": proc_col, "LOAD_ACTION": load_action_col, "email": email_col}
+        cfg = {"query_text": query_text, "bind_keys": bind_keys, "TABLE_NAME": table_name_col, "PROC": proc_col, "LOAD_ACTION": load_action_col, "email": email_col, "argocfg": argocfg}
         return cfg
 
 
@@ -570,7 +571,7 @@ def _send_result_via_email(cfg: Dict[str, Any], job: Dict[str, Any], result: Dic
         logger.exception("Unexpected error preparing/sending bulk job email for %s:%s", job.get("filename"), job.get("query_identifier"))
 
 
-def _process_bulk_rows(cfg: Dict[str, Any], rows_iterable, expected_keys: List[str], job_filename: str, job_qid: str, job_chunk: int = 1000):
+async def _process_bulk_rows(cfg: Dict[str, Any], rows_iterable, expected_keys: List[str], job_filename: str, job_qid: str, job_chunk: int = 1000):
     """Shared helper to process bulk rows (CSV dicts or JSON dicts).
 
     - cfg: configuration row fetched from DB (contains query_text, email, etc.)
@@ -670,6 +671,10 @@ def _process_bulk_rows(cfg: Dict[str, Any], rows_iterable, expected_keys: List[s
         try:
             if cfg and cfg.get("email") and result and result.get("status") == "success":
                 _send_result_via_email(cfg, {"filename": job_filename, "query_identifier": job_qid}, result)
+            if cfg and cfg.get("argocfg") and result and result.get("status") == "success":
+                argResp = await post_argo_worflow(cfg.get("argocfg"))
+                if argResp:
+                    result["argowfname"]=argResp.name
         except Exception:
             logger.exception("Error sending email for bulk job %s:%s", job_filename, job_qid)
 
@@ -954,7 +959,7 @@ def forgot_password(req: ForgotPasswordRequest, api_key: str = Depends(API_KEY_H
 
 
 @app.post("/executeConfigBulk")
-def execute_config_bulk(
+async def execute_config_bulk(
     # New contract: accept multiple jobs and multiple files
     # jobs: JSON string, list of objects {"filename":..., "query_identifier":..., "chunk_size": <int>}
     jobs: str = Form(...),
@@ -1077,6 +1082,10 @@ def execute_config_bulk(
                 try:
                     if cfg and cfg.get("email") and res and res.get("status") == "success":
                         _send_result_via_email(cfg, job, res)
+                    if cfg and cfg.get("argocfg") and res and res.get("status") == "success":
+                        argResp = await post_argo_worflow(cfg.get("argocfg"))
+                        if argResp:
+                            res["argowfname"]=argResp["metadata"]["name"]
                 except Exception:
                     logger.exception("Error sending email for file_loader job %s:%s", job.get("filename"), job.get("query_identifier"))
                 results.append(res)
@@ -1207,6 +1216,90 @@ def create_token(req: TokenRequest, api_key: str = Depends(API_KEY_HEADER)):
     token = jwt.encode(payload, secret, algorithm=algo)
 
     return {"access_token": token, "token_type": "bearer", "expires_at": exp.isoformat() + "Z"}
+
+@app.get("/getElasticLogs/{wfID}")
+async def get_elasticLogs(wfID: str, auth=Depends(authenticate)):
+    payload = {
+        "query": {
+            "term": {
+            "rpa_argo_workflow_name.keyword": wfID
+            }
+        },
+        "sort": [
+            { "@timestamp": { "order": "desc" } }
+        ]
+    }
+    headers={
+        "Content-Type":"application/json"
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post("http://lonchman01:32134/elastic/rpa-logs/_search",
+                        json=payload,
+                        headers=headers
+                        )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502,detail=str(e))
+    return response.json();
+
+# @app.post("/postArgoWorkflow/")
+async def post_argo_worflow(worflowTemp:str):
+    payload={
+            "namespace": "default",
+            "resourceKind": "Workflow",
+            "resourceName": "python-echo",
+            "submitOptions": {
+                "annotations": "example=python-echo",
+                "dryRun": "false",
+                "entryPoint": "echo-steps",
+                "generateName": "python-echo-",
+                "labels": "app=demo",
+                "name": "python-echo",
+                "ownerReference": {
+                "apiVersion": "argoproj.io/v1alpha1",
+                "blockOwnerDeletion": "false",
+                "controller": "true",
+                "kind": "Workflow",
+                "name": "python-echo",
+                "uid": "1234567890"
+                },
+                "parameters": [],
+                "podPriorityClassName": "",
+                "priority": 0,
+                "serverDryRun": "false",
+                "serviceAccount": "default"
+            },
+            "workflow": {
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Workflow",
+            "metadata": {
+                "generateName": "python-argo-workflow-",
+                "namespace": "rpa-job-prod",
+                "labels": {
+                "rpa-name": "argowftemp"
+                }
+            },
+            "spec": {
+                "workflowTemplateRef": {
+                "name": worflowTemp
+                    }
+                }
+            }
+        }
+
+    headers={
+        "Content-Type":"application/json"
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post("http://lonchman01:32134/argo/api/v1/workflows/rpa-job-prod",
+                        json=payload,
+                        headers=headers
+                        )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502,detail=str(e))
+    return response.json();
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
