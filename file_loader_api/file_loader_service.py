@@ -7,12 +7,9 @@ is true. It reuses existing helpers from `file_loader` and
 `file_loader_api.common_lib` (update_sql, update_sql_oi_rtqm, insert_to_oi_rtqm,
 fileloaderdecisionmaker) where available.
 
-The function `process_file_loader_job(cfg, upload_file, logical_filename)` is
+The function `process_file_loader_job(cfg, upload_file, logical_filename, run_proc=False)` is
 the main entry point and returns a dict result suitable for inclusion in the
 API response.
-
-Comments are included to explain each step and match the numbered steps in
-the task description (steps 6-14 of the original main workflow).
 """
 from __future__ import annotations
 import os
@@ -23,7 +20,7 @@ import datetime
 import logging
 import json
 import pandas as pd
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 # Reuse existing helpers from the file_loader package when available
 try:
@@ -58,10 +55,9 @@ except Exception:
 
 
 def _adjust_utc_to_db_tz(dt_utc: datetime.datetime) -> str:
-    """Apply deterministic +05:30 offset and return timestamp string used in UV."""
+    """Apply deterministic 5.5-hour offset and return timestamp string used in UV."""
     offset = datetime.timedelta(hours=5, minutes=30)
     adjusted = dt_utc + offset
-    # Use the compact format similar to file_loader/main.py: YYYYMMDDHHMMSS
     return adjusted.strftime("%Y%m%d%H%M%S")
 
 
@@ -99,6 +95,7 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
       cfg: configuration dict from `config_table` (should contain query_text and bind_keys)
       upload_file: FastAPI UploadFile-like object
       logical_filename: supplied filename parameter used to build UV
+      run_proc: API-level override to execute configured procedure instead of the insert flow
 
     Returns:
       dict with status and metadata (rows_inserted, uv, table) or error details
@@ -128,7 +125,7 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
         if sel is not None and hasattr(sel, "empty") and not sel.empty:
             return {"status": "error", "message": "File already processed", "uv": uv, "code": 409}
     except Exception:
-        # logger.exception("UV duplicate check failed; continuing")
+        # duplicate check failure is non-fatal
         pass
 
     # Step 3: Insert in-progress log row
@@ -139,38 +136,33 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
         logColumns = ",".join(x for x in logDF.columns)
         value_placeholder_list = ", ".join([f":{i+1}" for i in range(len(logDF.columns))])
         if insert_to_oi_rtqm:
-            # call using kwargs similar to original module
             insert_to_oi_rtqm(schema_table='RPA_INPUTS.EXCEL_LOAD_TO_ORACLE', data_to_insert=df_vals, placeholder_list=value_placeholder_list, table_columns=logColumns)
         else:
-            # fallback: try direct update_sql insert
             cols = ",".join(logDF.columns)
             vals = ",".join(["'" + str(v).replace("'", "''") + "'" for v in [logical_filename, uv, schema_table, socket.gethostname()] ])
             if update_sql:
                 update_sql(f"INSERT INTO RPA_INPUTS.EXCEL_LOAD_TO_ORACLE ({cols}) VALUES ({vals})")
     except Exception:
-        # logger.exception("Failed to insert in-progress log row")
         return {"status": "error", "message": "Failed to create in-progress log row", "uv": uv}
 
     # Step 4: Read CSV in-memory
     try:
+        upload_file.file.seek(0)
         raw = upload_file.file.read()
         try:
             df = pd.read_csv(io.BytesIO(raw), dtype=str)
         except Exception:
             df = pd.read_csv(io.BytesIO(raw), encoding='iso-8859-1', dtype=str)
     except Exception:
-        # logger.exception("Failed to read CSV in-memory")
         return {"status": "error", "message": "Failed to read CSV file", "uv": uv}
 
     # Step 5: Column mapping / normalization
-    # If cfg contains a COLUMN_MAPPING-like key, attempt to apply
     column_mapping_raw = cfg.get("COLUMN_MAPPING") or cfg.get("column_mapping")
     col_map = None
     if column_mapping_raw:
         try:
             col_map = ast.literal_eval(str(column_mapping_raw))
         except Exception:
-            # logger.exception("Failed to parse COLUMN_MAPPING; falling back to normalization")
             pass
 
     if isinstance(col_map, dict):
@@ -183,22 +175,122 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
     else:
         df.columns = [_normalize_column_name(c) for c in df.columns]
 
-    # df = df.fillna("").astype(str).applymap(lambda v: v.replace('\n', ' ').replace('\r', ' '))
     df = df.fillna("").astype(str).replace({r'[\n\r]+': ' '}, regex=True)
 
-    # Step 6: Build insert payload
+    # Prepare commonly used fields
     cols_upper = [c.upper() for c in df.columns]
-    # Validate headers against bind_keys if provided
-    if bind_keys_csv:
-        expected = [k.strip().upper() for k in bind_keys_csv.split(",") if k.strip()]
-        if expected and expected != cols_upper:
-            return {"status": "error", "message": f"CSV headers do not match bind keys. Expected: {expected}, got: {cols_upper}", "uv": uv}
+    expected_keys = [k.strip().upper() for k in bind_keys_csv.split(",") if k.strip()] if bind_keys_csv else []
 
+    # Derive runProc: true when both query_text and load_action are 'NA' (case-insensitive)
+    query_text_val = (cfg.get("query_text") or "").strip().upper()
+    load_action_val = (cfg.get("load_action") or cfg.get("LOAD_ACTION") or "").strip().upper()
+    derived_runproc = (query_text_val == "NA" and load_action_val == "NA")
+    cfg_runproc_flag = bool(cfg.get("runProc") or cfg.get("run_proc") or cfg.get("RUN_PROC"))
+    run_proc_flag = derived_runproc or cfg_runproc_flag
+
+    if run_proc_flag:
+        proc_val = (action or "").strip()
+        if not proc_val:
+            return {"status": "error", "message": "runProc requested but no procedure configured in proc column", "uv": uv}
+
+        # Validate headers when bind keys are present
+        if expected_keys and expected_keys != cols_upper:
+            return {"status": "error", "message": f"CSV headers do not match bind keys for runProc. Expected: {expected_keys}, got: {cols_upper}", "uv": uv}
+
+        # Only one row allowed for runProc
+        if len(df) != 1:
+            return {"status": "error", "message": "runProc scenario accepts CSV with exactly one row", "uv": uv}
+
+        # Build argument list from the single row following expected_keys order
+        row = df.iloc[0]
+        args_list: List[str] = []
+        if expected_keys:
+            for key in expected_keys:
+                try:
+                    idx = cols_upper.index(key)
+                    raw_val = row.iloc[idx]
+                except Exception:
+                    raw_val = None
+                if raw_val is None or str(raw_val).strip() == "":
+                    args_list.append("NULL")
+                else:
+                    safe = str(raw_val).replace("'", "''")
+                    args_list.append(f"'{safe}'")
+
+        args_str = ",".join(args_list)
+
+        # Construct PL/SQL statement
+        pv = proc_val
+        if pv.strip().upper().startswith("BEGIN"):
+            proc_stmt = pv
+        else:
+            if "(" in pv and ")" in pv:
+                proc_stmt = f"BEGIN {pv}; END;"
+            else:
+                if args_str:
+                    proc_stmt = f"BEGIN {pv}({args_str}); END;"
+                else:
+                    proc_stmt = f"BEGIN {pv}(); END;"
+
+        start_time = datetime.datetime.utcnow()
+        try:
+            exec_result = None
+            if update_sql_oi_rtqm:
+                exec_result = update_sql_oi_rtqm(proc_stmt)
+            elif update_sql:
+                exec_result = update_sql(proc_stmt)
+            execution_time_ms = int((datetime.datetime.utcnow() - start_time).total_seconds() * 1000)
+
+            # Log success
+            try:
+                logger.info(json.dumps({
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                    "file_name": logical_filename,
+                    "query_identifier": cfg.get("query_identifier", ""),
+                    "query": proc_stmt,
+                    "parameters": "CSV single-row bind parameters",
+                    "status": "success",
+                    "execution_time_ms": execution_time_ms
+                }))
+            except Exception:
+                pass
+
+            # Mark processed
+            try:
+                if update_sql:
+                    update_sql(f"UPDATE RPA_INPUTS.EXCEL_LOAD_TO_ORACLE SET PROCESSINGTIME = systimestamp WHERE UV = '{uv}'")
+            except Exception:
+                pass
+
+            return {
+                "status": "success",
+                "type": "proc",
+                "data": {"message": "Procedure executed", "rows": 1},
+                "execution_time_ms": execution_time_ms,
+                "metadata": {"file_name": logical_filename, "query_identifier": cfg.get("query_identifier", "")},
+                "error": None,
+                "raw_result": exec_result,
+                "uv": uv
+            }
+        except Exception as e:
+            try:
+                logger.exception("runProc execution failed: %s", e)
+            except Exception:
+                pass
+            try:
+                if update_sql:
+                    err_msg = str(e).replace("'", "''")
+                    update_sql(f"UPDATE RPA_INPUTS.EXCEL_LOAD_TO_ORACLE SET SV6 = 'ERROR', SV7 = '{err_msg[:4000]}' WHERE UV = '{uv}'")
+            except Exception:
+                pass
+            return {"status": "error", "message": "runProc execution failed", "detail": str(e), "uv": uv}
+
+    # Continue with normal insert flow
     finalInsertColumn = ",".join([f'"{c}"' for c in cols_upper])
     data = [tuple(row) for row in df.itertuples(index=False, name=None)]
     placeholder_list = ", ".join([f":{i+1}" for i in range(len(cols_upper))])
 
-    # Step 7: Apply decision maker
+    # Apply decision maker if present
     try:
         if fileloaderdecisionmaker and hasattr(fileloaderdecisionmaker, 'file_loader_decision_maker'):
             try:
@@ -206,50 +298,38 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
                 if isinstance(fm_ret, (list, tuple)) and len(fm_ret) >= 3:
                     finalInsertColumn, data, placeholder_list = fm_ret[0], fm_ret[1], fm_ret[2]
             except Exception:
-                # logger.exception("Decision maker raised an exception; continuing")
                 pass
     except Exception:
-        # logger.exception("Error calling decision maker")
         pass
 
-    # Step 8: Insert into target table and run PROC
+    # Perform insert and optional proc
     try:
-        # If the helper is available it may support load_action/proc natively
         if insert_to_oi_rtqm:
             insert_to_oi_rtqm(schema_table=schema_table, data_to_insert=data, placeholder_list=placeholder_list, table_columns=finalInsertColumn.upper(), action=action, load_action=load_action)
         else:
-            # Fallback path: delegate Oracle-specific operations to oracle_insights.update_sql
-            # which knows how to handle executemany, TRUNCATE, and PL/SQL blocks.
             load_action_upper = (load_action or "").strip().upper()
             proc_val = (action or "").strip()
 
-            # TRUNCATE (or DELETE fallback) before insert if requested
             if load_action_upper == "TRUNCATE":
-                # Procedure expects the unqualified table name only
                 table_only = str(schema_table).split('.')[-1].strip().strip('"')
                 try:
                     if update_sql:
-                            update_sql(f"BEGIN OI_RTQM.truncate_my_table('{table_only}'); END;")
+                        update_sql(f"BEGIN OI_RTQM.truncate_my_table('{table_only}'); END;")
                 except Exception:
-                    # If proc-based truncate fails, fall back to DELETE FROM as last resort
                     try:
                         if update_sql:
                             update_sql(f"DELETE FROM {schema_table}")
                     except Exception:
-                        # logger.exception("Failed to clear target table %s before insert", schema_table)
                         pass
 
-            # Perform batch insert using the oracle helper when available
             if update_sql_oi_rtqm:
                 insert_sql = f"insert into {schema_table} ({finalInsertColumn}) values ({placeholder_list})"
                 update_sql_oi_rtqm(insert_sql, data)
             elif update_sql:
-                # Use oracle_insights.update_sql which supports executemany via data param
                 insert_sql = f"INSERT INTO {schema_table} ({finalInsertColumn}) VALUES ({placeholder_list})"
                 try:
                     update_sql(insert_sql, data)
                 except Exception:
-                    # Fallback: try per-row via update_sql to increase robustness
                     for row in data:
                         vals = ",".join(["'" + str(v).replace("'", "''") + "'" for v in row])
                         update_sql(f"INSERT INTO {schema_table} ({finalInsertColumn}) VALUES ({vals})")
@@ -261,17 +341,14 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
                     if pv.lower().startswith("execute "):
                         pv = pv.split(None, 1)[1]
                     if update_sql:
-                        # oracle_insights.update_sql recognizes BEGIN... blocks
                         update_sql(f"BEGIN {pv}; END;")
             except Exception:
-                # logger.exception("Failed to execute PROC %s for table %s", proc_val, schema_table)
                 pass
 
         rows_inserted = len(data)
 
-        # Write structured success log (same format as main.log_query)
         try:
-            logging.info(json.dumps({
+            logger.info(json.dumps({
                 "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
                 "file_name": logical_filename,
                 "query_identifier": cfg.get("query_identifier", ""),
@@ -283,13 +360,10 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
                 "rows_affected": rows_inserted
             }))
         except Exception:
-            # ignore logging failures
             pass
     except Exception as e:
-        # logger.exception("Insert or PROC failed: %s", e)
-        # Write structured error into query log (same schema as main.log_query)
         try:
-            logging.info(json.dumps({
+            logger.info(json.dumps({
                 "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
                 "file_name": logical_filename,
                 "query_identifier": cfg.get("query_identifier", ""),
@@ -299,16 +373,13 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
                 "error_message": str(e)
             }))
         except Exception:
-            # logger.exception("Failed to write error query log")
             pass
 
-        # Update log row with error indicator if possible
         try:
             if update_sql:
                 err_msg = str(e).replace("'", "''")
                 update_sql(f"UPDATE RPA_INPUTS.EXCEL_LOAD_TO_ORACLE SET SV6 = 'ERROR', SV7 = '{err_msg[:4000]}' WHERE UV = '{uv}'")
         except Exception:
-            # logger.exception("Failed to update error status in log row")
             pass
         return {"status": "error", "message": "DB insert or PROC failed", "uv": uv}
 
@@ -317,7 +388,6 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
         if update_sql:
             update_sql(f"UPDATE RPA_INPUTS.EXCEL_LOAD_TO_ORACLE SET PROCESSINGTIME = systimestamp WHERE UV = '{uv}'")
     except Exception:
-        # logger.exception("Failed to mark PROCESSINGTIME for UV=%s", uv)
         pass
 
     # Step 10: Persist processed file optionally
@@ -325,13 +395,13 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
         if not IS_FILELOADER_TEST:
             processed_dir = os.path.join(os.path.dirname(__file__), 'processed')
             os.makedirs(processed_dir, exist_ok=True)
-            tsfile = datetime.datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')
+            tsfile = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')
             safe_name = f"{logical_filename}_{tsfile}.csv"
             out_path = os.path.join(processed_dir, safe_name)
+            upload_file.file.seek(0)
             with open(out_path, 'wb') as fh:
                 fh.write(upload_file.file.read())
     except Exception:
-        # logger.exception("Failed to persist processed file for UV=%s", uv)
         pass
 
     # Step 11: return success
