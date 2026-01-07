@@ -109,7 +109,11 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
     load_action = cfg.get("load_action") or cfg.get("LOAD_ACTION") or None
     bind_keys_csv = cfg.get("bind_keys") or cfg.get("BIND_KEYS") or cfg.get("bind_keys_csv")
 
-    if not schema_table:
+    query_text_val = (cfg.get("query_text") or "").strip().upper()
+    load_action_val = (cfg.get("load_action") or cfg.get("LOAD_ACTION") or "").strip().upper()
+    run_proc_flag =  (query_text_val == "NA" and load_action_val == "NA")
+    
+    if not schema_table and not run_proc_flag:
         return {"status": "error", "message": "Configuration missing schema/table name"}
 
     # Step 2: Build UV and duplicate check
@@ -149,10 +153,11 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
     try:
         upload_file.file.seek(0)
         raw = upload_file.file.read()
-        try:
-            df = pd.read_csv(io.BytesIO(raw), dtype=str)
-        except Exception:
-            df = pd.read_csv(io.BytesIO(raw), encoding='iso-8859-1', dtype=str)
+        if raw:
+            try:
+                df = pd.read_csv(io.BytesIO(raw), dtype=str)
+            except Exception:
+                df = pd.read_csv(io.BytesIO(raw), encoding='iso-8859-1', dtype=str)
     except Exception:
         return {"status": "error", "message": "Failed to read CSV file", "uv": uv}
 
@@ -176,18 +181,15 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
         df.columns = [_normalize_column_name(c) for c in df.columns]
 
     df = df.fillna("").astype(str).replace({r'[\n\r]+': ' '}, regex=True)
+    
+    # added to remove the null extra character.
+    df = df.apply(lambda col: col.map(lambda x: x.replace('\xa0', ' ').strip() if isinstance(x, str) else x))
 
     # Prepare commonly used fields
     cols_upper = [c.upper() for c in df.columns]
     expected_keys = [k.strip().upper() for k in bind_keys_csv.split(",") if k.strip()] if bind_keys_csv else []
 
     # Derive runProc: true when both query_text and load_action are 'NA' (case-insensitive)
-    query_text_val = (cfg.get("query_text") or "").strip().upper()
-    load_action_val = (cfg.get("load_action") or cfg.get("LOAD_ACTION") or "").strip().upper()
-    derived_runproc = (query_text_val == "NA" and load_action_val == "NA")
-    cfg_runproc_flag = bool(cfg.get("runProc") or cfg.get("run_proc") or cfg.get("RUN_PROC"))
-    run_proc_flag = derived_runproc or cfg_runproc_flag
-
     if run_proc_flag:
         proc_val = (action or "").strip()
         if not proc_val:
@@ -221,16 +223,17 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
 
         # Construct PL/SQL statement
         pv = proc_val
+        procName = None
         if pv.strip().upper().startswith("BEGIN"):
             proc_stmt = pv
         else:
-            if "(" in pv and ")" in pv:
-                proc_stmt = f"BEGIN {pv}; END;"
+            if args_str:
+                procName = pv.split(" ")[1]
+                procName = procName.replace("(","")
+                proc_stmt = f"BEGIN {pv}({args_str}); END;"
             else:
-                if args_str:
-                    proc_stmt = f"BEGIN {pv}({args_str}); END;"
-                else:
-                    proc_stmt = f"BEGIN {pv}(); END;"
+                procName = pv.split(" ")[1]
+                proc_stmt = f"BEGIN {pv}; END;"
 
         start_time = datetime.datetime.utcnow()
         try:
@@ -238,7 +241,10 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
             if update_sql_oi_rtqm:
                 exec_result = update_sql_oi_rtqm(proc_stmt)
             elif update_sql:
-                exec_result = update_sql(proc_stmt)
+                if args_str != "":
+                    exec_result = update_sql(proc_stmt,None,procName+":"+args_str)
+                else:
+                    exec_result = update_sql(proc_stmt,None,procName)
             execution_time_ms = int((datetime.datetime.utcnow() - start_time).total_seconds() * 1000)
 
             # Log success
