@@ -101,12 +101,26 @@ except Exception:
 #                 connection.commit()
 #                 connection.close()
 
+def clean_params(raw_params):
+    cleaned = []
+    for p in raw_params:
+        val = p.strip("'").strip('"')   # extra quotes हटाओ
+        # अगर numeric है तो int/float में convert करो
+        if val.isdigit():
+            cleaned.append(int(val))
+        else:
+            try:
+                cleaned.append(float(val))
+            except ValueError:
+                cleaned.append(val)  # string ही रहने दो
+    return cleaned
 
 # Best variant of the original method, with new library, correctly handling LOB columns, and using SQL alchemy for full pandas compatibility
-def update_sql(sql, data=None):
+def update_sql(sql, data=None, runProcFlag=None):
     connection = None
     cursor = None
     engine = None
+    df = None
     try:
         # Create DSN for oracledb
         dsn = oracledb.makedsn(DB_HOST, DB_PORT, service_name=DB_SERVICE_NAME)
@@ -121,8 +135,17 @@ def update_sql(sql, data=None):
         elif sql.strip().upper().startswith(('TRUNCATE', 'MERGE', 'INSERT', 'UPDATE')):
             cursor.execute(sql)
             df = None
+        elif runProcFlag is not None:
+            proData = runProcFlag.split(":");
+            if len(proData) > 1:
+                procName = proData[0]
+                procParam = clean_params(proData[1].split(","))
+                cursor.callproc(procName,procParam)
+                df=None
+            else:
+                cursor.callproc(proData[0])
         elif sql.strip().upper().startswith(('EXEC', 'BEGIN')):
-            # sql = f'BEGIN {sql.split(" ")[1]}; END;' //commented since giving ora error with semicolon
+            # sql = f'BEGIN {sql.split(" ")[1]}; END;' #commented since giving ora error with semicolon
             cursor.execute(sql)
             df = None
         else:
