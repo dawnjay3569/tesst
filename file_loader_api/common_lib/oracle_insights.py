@@ -116,7 +116,7 @@ def clean_params(raw_params):
     return cleaned
 
 # Best variant of the original method, with new library, correctly handling LOB columns, and using SQL alchemy for full pandas compatibility
-def update_sql(sql, data=None, runProcFlag=None):
+def update_sql(sql, data=None, procName=None,procParms=None):
     connection = None
     cursor = None
     engine = None
@@ -135,15 +135,15 @@ def update_sql(sql, data=None, runProcFlag=None):
         elif sql.strip().upper().startswith(('TRUNCATE', 'MERGE', 'INSERT', 'UPDATE')):
             cursor.execute(sql)
             df = None
-        elif runProcFlag is not None:
-            proData = runProcFlag.split(":");
-            if len(proData) > 1:
-                procName = proData[0]
-                procParam = clean_params(proData[1].split(","))
-                cursor.callproc(procName,procParam)
+        elif procName is not None:
+            # proData = runProcFlag.split(":");
+            if procParms is not None:
+                # procName = proData[0]
+                # procParam = clean_params(proData[1].split(","))
+                cursor.callproc(procName,procParms)
                 df=None
             else:
-                cursor.callproc(proData[0])
+                cursor.callproc(procName)
         elif sql.strip().upper().startswith(('EXEC', 'BEGIN')):
             # sql = f'BEGIN {sql.split(" ")[1]}; END;' #commented since giving ora error with semicolon
             cursor.execute(sql)

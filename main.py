@@ -33,6 +33,7 @@ import uuid
 from passlib.context import CryptContext
 from fastapi.responses import JSONResponse
 from file_loader_api.file_loader_service import process_file_loader_job
+from file_loader_api.common_lib.oracle_insights import update_sql
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 app = FastAPI(title="FAPI_QExec")
@@ -719,7 +720,73 @@ def execute_config(req: ConfigExecuteRequest, auth=Depends(authenticate)):
     # We use the same options/metadata defaults
     options = QueryOptions()
     metadata = QueryMetadata(file_name=req.filename, query_identifier=req.query_identifier)
+    
+    if cfg['query_text'] == 'NA' and cfg['LOAD_ACTION'] == 'NA':
+            # Derive runProc: true when both query_text and load_action are 'NA' (case-insensitive)
+        procName = (cfg['PROC'] or "").strip()
+        if procName == "":
+            return {"status": "error", "message": "runProc requested but no procedure configured in proc column"}
 
+        # Build argument list from the single row following expected_keys order
+        args_str = list(named_params.values())
+
+        # Construct PL/SQL statement
+        pv = procName
+        if pv.strip().upper().startswith("BEGIN"):
+            proc_stmt = pv
+        else:
+            if len(args_str)>0:
+                procName = pv.split(" ")[1]
+                procName = procName.replace("(","")
+                proc_stmt = f"BEGIN {pv}({args_str}); END;"
+            else:
+                procName = pv.split(" ")[1]
+                proc_stmt = f"BEGIN {pv}; END;"
+
+        start_time = time.time()
+        try:
+            if len(args_str)>0:
+                exec_result = update_sql(proc_stmt,None,procName,args_str)
+            else:
+                exec_result = update_sql(proc_stmt,None,procName)
+            execution_time_ms = int((time.time() - start_time) * 1000) if options.track_performance else None
+
+            # Log success
+            log_query({
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "file_name": metadata.file_name,
+                    "query_identifier": metadata.query_identifier,
+                    "query": "PROC_EXECUTED",
+                    "parameters": args_str,
+                    "status": "success",
+                    "execution_time_ms": execution_time_ms,
+                    "bulk": True,
+                    "rows_affected": "NA"
+                })
+
+            data = {
+                "columns": [],
+                "rows": [],
+                "row_count": "NA",
+                "last_insert_id": "NA",
+                "message": "Procedure executed successfully"
+            }
+
+            return {
+                "status": "success",
+                "type": "PROC",
+                "data": data,
+                "execution_time_ms": execution_time_ms,
+                "metadata": {
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "file_name": metadata.file_name,
+                    "query_identifier": metadata.query_identifier
+                },
+                "error": None
+            }
+        except Exception as e:
+            logger.exception("Unable to execute procedure")
+            
     # run_generic_query expects positional parameters list; but it accepts parameterized query too
     # We'll call the lower-level run to avoid re-parsing; use a tiny wrapper
     result = run_generic_query(cfg["query_text"], [], options, metadata) if not named_params else run_generic_query(cfg["query_text"], named_params, options, metadata)

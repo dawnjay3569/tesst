@@ -109,11 +109,11 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
     load_action = cfg.get("load_action") or cfg.get("LOAD_ACTION") or None
     bind_keys_csv = cfg.get("bind_keys") or cfg.get("BIND_KEYS") or cfg.get("bind_keys_csv")
 
-    query_text_val = (cfg.get("query_text") or "").strip().upper()
-    load_action_val = (cfg.get("load_action") or cfg.get("LOAD_ACTION") or "").strip().upper()
-    run_proc_flag =  (query_text_val == "NA" and load_action_val == "NA")
+    # query_text_val = (cfg.get("query_text") or "").strip().upper()
+    # load_action_val = (cfg.get("load_action") or cfg.get("LOAD_ACTION") or "").strip().upper()
+    # run_proc_flag =  (query_text_val == "NA" and load_action_val == "NA")
     
-    if not schema_table and not run_proc_flag:
+    if not schema_table:
         return {"status": "error", "message": "Configuration missing schema/table name"}
 
     # Step 2: Build UV and duplicate check
@@ -188,108 +188,6 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
     # Prepare commonly used fields
     cols_upper = [c.upper() for c in df.columns]
     expected_keys = [k.strip().upper() for k in bind_keys_csv.split(",") if k.strip()] if bind_keys_csv else []
-
-    # Derive runProc: true when both query_text and load_action are 'NA' (case-insensitive)
-    if run_proc_flag:
-        proc_val = (action or "").strip()
-        if not proc_val:
-            return {"status": "error", "message": "runProc requested but no procedure configured in proc column", "uv": uv}
-
-        # Validate headers when bind keys are present
-        if expected_keys and expected_keys != cols_upper:
-            return {"status": "error", "message": f"CSV headers do not match bind keys for runProc. Expected: {expected_keys}, got: {cols_upper}", "uv": uv}
-
-        # Only one row allowed for runProc
-        if len(df) != 1:
-            return {"status": "error", "message": "runProc scenario accepts CSV with exactly one row", "uv": uv}
-
-        # Build argument list from the single row following expected_keys order
-        row = df.iloc[0]
-        args_list: List[str] = []
-        if expected_keys:
-            for key in expected_keys:
-                try:
-                    idx = cols_upper.index(key)
-                    raw_val = row.iloc[idx]
-                except Exception:
-                    raw_val = None
-                if raw_val is None or str(raw_val).strip() == "":
-                    args_list.append("NULL")
-                else:
-                    safe = str(raw_val).replace("'", "''")
-                    args_list.append(f"'{safe}'")
-
-        args_str = ",".join(args_list)
-
-        # Construct PL/SQL statement
-        pv = proc_val
-        procName = None
-        if pv.strip().upper().startswith("BEGIN"):
-            proc_stmt = pv
-        else:
-            if args_str:
-                procName = pv.split(" ")[1]
-                procName = procName.replace("(","")
-                proc_stmt = f"BEGIN {pv}({args_str}); END;"
-            else:
-                procName = pv.split(" ")[1]
-                proc_stmt = f"BEGIN {pv}; END;"
-
-        start_time = datetime.datetime.utcnow()
-        try:
-            exec_result = None
-            if update_sql_oi_rtqm:
-                exec_result = update_sql_oi_rtqm(proc_stmt)
-            elif update_sql:
-                if args_str != "":
-                    exec_result = update_sql(proc_stmt,None,procName+":"+args_str)
-                else:
-                    exec_result = update_sql(proc_stmt,None,procName)
-            execution_time_ms = int((datetime.datetime.utcnow() - start_time).total_seconds() * 1000)
-
-            # Log success
-            try:
-                logger.info(json.dumps({
-                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                    "file_name": logical_filename,
-                    "query_identifier": cfg.get("query_identifier", ""),
-                    "query": proc_stmt,
-                    "parameters": "CSV single-row bind parameters",
-                    "status": "success",
-                    "execution_time_ms": execution_time_ms
-                }))
-            except Exception:
-                pass
-
-            # Mark processed
-            try:
-                if update_sql:
-                    update_sql(f"UPDATE RPA_INPUTS.EXCEL_LOAD_TO_ORACLE SET PROCESSINGTIME = systimestamp WHERE UV = '{uv}'")
-            except Exception:
-                pass
-
-            return {
-                "status": "success",
-                "type": "proc",
-                "data": {"message": "Procedure executed", "rows": 1},
-                "execution_time_ms": execution_time_ms,
-                "metadata": {"file_name": logical_filename, "query_identifier": cfg.get("query_identifier", "")},
-                "error": None,
-                "raw_result": exec_result,
-                "uv": uv
-            }
-        except Exception as e:
-            try:
-                logger.exception("runProc execution failed: %s", e)
-            except Exception:
-                pass
-            try:
-                if update_sql:
-                    err_msg = str(e).replace("'", "''")
-                    update_sql(f"UPDATE RPA_INPUTS.EXCEL_LOAD_TO_ORACLE SET SV6 = 'ERROR', SV7 = '{err_msg[:4000]}' WHERE UV = '{uv}'")
-            except Exception:
-                pass
-            return {"status": "error", "message": "runProc execution failed", "detail": str(e), "uv": uv}
 
     # Continue with normal insert flow
     finalInsertColumn = ",".join([f'"{c}"' for c in cols_upper])
@@ -372,7 +270,7 @@ def process_file_loader_job(cfg: Dict[str, Any], upload_file, logical_filename: 
             logger.info(json.dumps({
                 "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
                 "file_name": logical_filename,
-                "query_identifier": cfg.get("query_identifier", ""),
+                "query_identifier": cfg.get("query_identifier", "") ,
                 "query": cfg.get("query_text") or "",
                 "parameters": "CSV rows",
                 "status": "error",
