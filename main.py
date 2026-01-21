@@ -155,12 +155,9 @@ def _coerce_multi_value(v, bind_name: Optional[str] = None, query_text: Optional
             except Exception:
                 pass
         
-        # don't split if it's a regex with {n,m}
-        if re.search(r"\{[0-9]+,[0-9]*\}", s): 
+        if re.search(r"\{[0-9]+(,[0-9]*)?\}", s): 
             return s
-        
-        # comma separated -> split
-        if "," in s:
+        elif "," in s:
             parts = [p.strip() for p in s.split(",") if p.strip()]
             def _conv(x):
                 if x.isdigit():
@@ -359,7 +356,7 @@ def run_generic_query(query: str, parameters: List[Any], options: QueryOptions, 
         if is_named:
             stmt = text(query)
             for name, val in params.items():
-                if isinstance(val, (list, tuple)) and ":{} IN".format(name) in query:
+                if isinstance(val, (list, tuple)):
                     stmt = stmt.bindparams(bindparam(name, expanding=True))
 
             if sql_type in ["insert", "update", "delete", "ddl"]:
