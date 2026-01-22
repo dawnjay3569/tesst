@@ -157,7 +157,7 @@ def _coerce_multi_value(v, bind_name: Optional[str] = None, query_text: Optional
         
         if re.search(r"\{[0-9]+(,[0-9]*)?\}", s): 
             return s
-        elif "," in s:
+        elif "," in s and _bind_used_in_in_clause(query_text or "", bind_name or ""):
             parts = [p.strip() for p in s.split(",") if p.strip()]
             def _conv(x):
                 if x.isdigit():
