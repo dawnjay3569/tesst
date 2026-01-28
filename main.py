@@ -362,6 +362,17 @@ def run_generic_query(query: str, parameters: List[Any], options: QueryOptions, 
             if sql_type in ["insert", "update", "delete", "ddl"]:
                 trans = conn.begin()
                 try:
+                    if sql_type == "update":
+                        query=str(stmt)
+                        lower_q = query.lower()
+                        set_pos = lower_q.find("set")
+                        where_pos = lower_q.find("where")
+                        before_set = query[:set_pos]
+                        set_part = query[set_pos+3:where_pos]
+                        where_part = query[where_pos:]
+                        new_set_part = ",".join([ k for k in set_part.split(",") if k.split(":")[1].strip() in params.keys()])
+                        updted_query = before_set.strip()+" set "+new_set_part.strip()+" "+where_part.strip()
+                        stmt = text(updted_query)
                     result = conn.execute(stmt, params)
                     trans.commit()
                 except Exception:
@@ -512,7 +523,9 @@ def validate_and_prepare_bind(bind_keys_csv: Optional[str], bind_variables: Dict
 
     # Validate presence
     missing = [k for k in expected if k not in bind_variables]
-    if missing:
+    if missing and "update" in bind_variables["_query_text"]:
+        expected = [k for k in expected if k not in missing]
+    elif missing:
         raise HTTPException(status_code=400, detail=f"Missing bind variables: {missing}")
 
     # Prepare dict for named parameters (:key or :name)
